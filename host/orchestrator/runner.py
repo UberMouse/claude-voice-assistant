@@ -7,8 +7,32 @@ from .state import OneShotMachine
 from .hotkey import HotkeyDispatcher, PressKind, run_pynput
 from .clients import SttHttpClient, ClaudeHttpClient, TtsHttpClient
 from host.audio.capture import Recorder
+from host.audio.vad import Endpointer, SileroVadModel
 
 log = logging.getLogger(__name__)
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _build_recorder(mic_name: str | None) -> Recorder:
+    """VAD endpointing is on by default; set VOICE_VAD=0 to fall back to
+    fixed-window capture."""
+    if not _bool_env("VOICE_VAD", True):
+        log.info("orchestrator: VAD disabled, using fixed-window capture")
+        return Recorder(device_name=mic_name)
+    endpointer = Endpointer(
+        speech_threshold=float(os.environ.get("VOICE_VAD_THRESHOLD", "0.5")),
+        silence_ms=int(os.environ.get("VOICE_SILENCE_MS", "800")),
+        max_ms=int(os.environ.get("VOICE_MAX_SECS", "30")) * 1000,
+        no_speech_ms=int(os.environ.get("VOICE_NO_SPEECH_SECS", "3")) * 1000,
+    )
+    return Recorder(device_name=mic_name, endpointer=endpointer, vad_scorer=SileroVadModel())
+
 
 async def amain():
     stt_url    = os.environ.get("VOICE_STT_URL",    "http://127.0.0.1:8001")
@@ -17,7 +41,7 @@ async def amain():
     hotkey     = os.environ.get("VOICE_HOTKEY",     "f3")
     mic_name   = os.environ.get("VOICE_MIC_NAME")  # substring match, Spike A
 
-    rec = Recorder(device_name=mic_name)
+    rec = _build_recorder(mic_name)
     stt = SttHttpClient(stt_url)
     tts = TtsHttpClient(tts_url)
     claude = ClaudeHttpClient(claude_url)
@@ -26,19 +50,26 @@ async def amain():
     loop = asyncio.get_event_loop()
     def on_kind(kind: PressKind):
         if kind == PressKind.SHORT:
-            asyncio.run_coroutine_threadsafe(_press_release_cycle(machine), loop)
+            asyncio.run_coroutine_threadsafe(_press_release_cycle(machine, rec), loop)
         else:
             log.info("orchestrator: long-press received (conversational mode not implemented yet)")
-            asyncio.run_coroutine_threadsafe(_press_release_cycle(machine), loop)
+            asyncio.run_coroutine_threadsafe(_press_release_cycle(machine, rec), loop)
 
-    # TODO(phase-1.5): MVP captures for a fixed VOICE_CAPTURE_SECS window after the keypress; true hold-to-talk semantics come later.
     dispatcher = HotkeyDispatcher(on_event=on_kind)
     log.info("orchestrator: listening on key %s", hotkey)
     await asyncio.to_thread(run_pynput, hotkey, dispatcher)
 
-async def _press_release_cycle(machine: OneShotMachine):
-    """For MVP we simulate a press/release tied to the HotkeyDispatcher firing post-release.
-    Capture for a default window of N seconds. A future iteration moves this to true press/release semantics."""
+
+async def _press_release_cycle(machine: OneShotMachine, rec: Recorder):
+    """F3 starts recording. VAD ends it on trailing silence; the max-duration
+    cap (VOICE_MAX_SECS, default 30s) is enforced by the endpointer, with the
+    executor wait timeout below as a belt-and-suspenders. Falls back to a
+    fixed window (VOICE_CAPTURE_SECS) when VAD is disabled."""
     await machine.on_press()
-    await asyncio.sleep(float(os.environ.get("VOICE_CAPTURE_SECS", "5")))
+    if rec.has_endpointer:
+        max_secs = int(os.environ.get("VOICE_MAX_SECS", "30"))
+        result = await rec.wait_for_end(timeout=max_secs + 2)
+        log.info("orchestrator: end-of-utterance result=%s", result)
+    else:
+        await asyncio.sleep(float(os.environ.get("VOICE_CAPTURE_SECS", "5")))
     await machine.on_release()
