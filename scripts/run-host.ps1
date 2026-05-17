@@ -30,29 +30,30 @@ if (-not $env:VOICE_MIC_NAME) {
   Write-Warning "List devices: .\.venv\Scripts\python.exe -m sounddevice"
 }
 
-$venvActivate = Join-Path $Root ".venv\Scripts\Activate.ps1"
+$venvBin = Join-Path $Root ".venv\Scripts"
 
-function Start-Service {
-  param([string]$Title, [string]$Command)
+function Start-VoiceService {
+  param([string]$Title, [string]$Exe)
+  $exePath = Join-Path $venvBin "$Exe.exe"
+  if (-not (Test-Path $exePath)) {
+    throw "Not found: $exePath (run .\scripts\install-host.ps1 first)"
+  }
+  # NOTE: do not put `;` inside the -Command string passed to wt.exe -- wt
+  # interprets `;` as a tab separator and you get extra empty tabs.
   if (Get-Command wt.exe -ErrorAction SilentlyContinue) {
-    # Open a new tab in the focused Windows Terminal window.
     Start-Process wt.exe -ArgumentList @(
       "-w", "0", "new-tab", "--title", $Title,
-      "powershell", "-NoExit", "-Command", ". '$venvActivate'; $Command"
+      "powershell", "-NoExit", "-Command", "& '$exePath'"
     )
   } else {
     Start-Process powershell -ArgumentList @(
-      "-NoExit",
-      "-Command",
-      ". '$venvActivate'; `$Host.UI.RawUI.WindowTitle = '$Title'; $Command"
+      "-NoExit", "-Command", "& '$exePath'"
     )
   }
 }
 
-Start-Service -Title "voice-stt"          -Command "voice-stt"
-Start-Sleep -Milliseconds 400
-Start-Service -Title "voice-tts"          -Command "voice-tts"
-Start-Sleep -Milliseconds 400
-Start-Service -Title "voice-orchestrator" -Command "voice-orchestrator"
+Start-VoiceService -Title "voice-stt"          -Exe "voice-stt"
+Start-VoiceService -Title "voice-tts"          -Exe "voice-tts"
+Start-VoiceService -Title "voice-orchestrator" -Exe "voice-orchestrator"
 
 Write-Host "==> Three services launched. Watch each tab/window for startup logs." -ForegroundColor Green
