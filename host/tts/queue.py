@@ -9,12 +9,14 @@ log = logging.getLogger(__name__)
 # DEBUG-TAG: tts-queue
 # Grep: grep -E "tts-(queue|server)"
 
+_STOP = object()  # sentinel distinct from any str value
+
+
 class PlaybackQueue:
     def __init__(self, play_fn: Callable[[str], Awaitable[None]]):
         self._play = play_fn
-        self._q: asyncio.Queue[str] = asyncio.Queue()
+        self._q: asyncio.Queue = asyncio.Queue()
         self._worker: asyncio.Task | None = None
-        self._stopping = False
 
     async def start(self) -> None:
         self._worker = asyncio.create_task(self._run())
@@ -27,18 +29,17 @@ class PlaybackQueue:
         await self._q.join()
 
     async def stop(self) -> None:
-        self._stopping = True
-        await self._q.put("")  # poison pill
+        await self._q.put(_STOP)
         if self._worker:
             await self._worker
 
     async def _run(self) -> None:
         while True:
-            text = await self._q.get()
+            item = await self._q.get()
             try:
-                if self._stopping and text == "":
+                if item is _STOP:
                     return
-                await self._play(text)
+                await self._play(item)
             except Exception:
                 log.exception("tts-queue: play failed")
             finally:
