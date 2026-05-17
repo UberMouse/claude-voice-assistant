@@ -40,7 +40,7 @@ Write-Host "==> Bootstrapping pip + uv in .venv"
 & $venvPython -m pip install --quiet --upgrade pip uv
 
 # 4. Install host extras (with CUDA wheels) and dev tools
-Write-Host "==> Installing dependencies (.[host-cuda,dev]) — slow first time"
+Write-Host "==> Installing dependencies (.[host-cuda,dev]) -- slow first time"
 & $venvPython -m uv pip install -e ".[host-cuda,dev]"
 if ($LASTEXITCODE -ne 0) { throw "uv pip install failed" }
 

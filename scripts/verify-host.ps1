@@ -38,7 +38,7 @@ Check "kokoro model present"      { Test-Path "kokoro-v1.0.onnx" }
 Check "voices file present"       { Test-Path "voices-v1.0.bin" }
 Check "sounddevice can enumerate" { & $venvPython -c "import sounddevice as sd; print(len(sd.query_devices()))" | Out-Null; $LASTEXITCODE -eq 0 }
 
-# Env checks (warnings only — these are user-set)
+# Env checks (warnings only -- these are user-set)
 if (-not $env:VOICE_CLAUDE_URL) {
   Write-Host "[WARN] VOICE_CLAUDE_URL not set (orchestrator will not reach the VM)" -ForegroundColor Yellow
 }
