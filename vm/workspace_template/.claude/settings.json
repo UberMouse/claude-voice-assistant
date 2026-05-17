@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(speak:*)",
+      "Read(~/voice-assistant/**)",
+      "Write(~/voice-assistant/**)",
+      "Edit(~/voice-assistant/**)",
+      "WebFetch"
+    ]
+  }
+}
