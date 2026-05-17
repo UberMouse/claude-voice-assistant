@@ -84,8 +84,9 @@ class ClaudeProcess:
                 try:
                     obj = json.loads(line)
                 except json.JSONDecodeError:
-                    log.debug("claude-daemon: non-JSON line: %r", line[:200])
+                    log.info("claude-daemon: stream non-JSON: %r", line[:200])
                     continue
+                _log_stream_event(obj)
                 t = obj.get("type")
                 if t == "system" and obj.get("subtype") == "init":
                     sid = obj.get("session_id")
@@ -94,7 +95,6 @@ class ClaudeProcess:
                         persist_session_id(sid)
                 elif t == "rate_limit_event":
                     self.last_rate_limit = obj.get("rate_limit_info")
-                    log.info("claude-daemon: rate_limit %s", self.last_rate_limit)
                 elif t == "result":
                     return obj.get("result", "")
 
@@ -111,3 +111,60 @@ class ClaudeProcess:
         except asyncio.TimeoutError:
             self._proc.terminate()
             await self._proc.wait()
+
+
+def _truncate(s: str, n: int = 240) -> str:
+    s = s.replace("\n", " ")
+    return s if len(s) <= n else s[:n] + "..."
+
+
+def _log_stream_event(obj: dict) -> None:
+    """Dump each stream-json event from `claude --print` for debugging.
+
+    DEBUG-TAG: claude-stream
+    Grep all debug logging added by this function with:
+        grep -E "claude-(daemon|stream)"
+    """
+    t = obj.get("type")
+    if t == "system":
+        sub = obj.get("subtype")
+        if sub == "init":
+            log.info("claude-stream: system/init session=%s tools=%s cwd=%s",
+                     obj.get("session_id"), obj.get("tools"), obj.get("cwd"))
+        else:
+            log.info("claude-stream: system/%s %s", sub, _truncate(json.dumps(obj), 200))
+    elif t == "assistant":
+        content = (obj.get("message") or {}).get("content")
+        if isinstance(content, str):
+            log.info("claude-stream: assistant.text %s", _truncate(content))
+        elif isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                bt = block.get("type")
+                if bt == "text":
+                    log.info("claude-stream: assistant.text %s", _truncate(block.get("text", "")))
+                elif bt == "tool_use":
+                    log.info("claude-stream: assistant.tool_use name=%s id=%s input=%s",
+                             block.get("name"), block.get("id"),
+                             _truncate(json.dumps(block.get("input", {})), 200))
+                else:
+                    log.info("claude-stream: assistant.%s %s", bt, _truncate(json.dumps(block), 160))
+    elif t == "user":
+        content = (obj.get("message") or {}).get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    log.info("claude-stream: tool_result id=%s is_error=%s content=%s",
+                             block.get("tool_use_id"), block.get("is_error"),
+                             _truncate(json.dumps(block.get("content")), 240))
+    elif t == "rate_limit_event":
+        log.info("claude-stream: rate_limit %s", obj.get("rate_limit_info"))
+    elif t == "result":
+        log.info("claude-stream: result subtype=%s is_error=%s text=%s",
+                 obj.get("subtype"), obj.get("is_error"),
+                 _truncate(obj.get("result", "") or ""))
+    else:
+        log.info("claude-stream: unknown type=%s %s", t, _truncate(json.dumps(obj), 200))
+
+
