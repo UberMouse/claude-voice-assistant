@@ -31,12 +31,17 @@ def _ensure_windows_cuda_dlls_on_path() -> None:
         return
     new_path = os.pathsep.join(extra + [os.environ.get("PATH", "")])
     env = {**os.environ, "PATH": new_path, "VOICE_STT_CUDA_PREFIXED": "1"}
-    # On Windows, os.execvpe replaces this process so subsequent loader calls
-    # see the prefixed PATH from process start. We can't use sys.argv here:
-    # pip/uv console-script .exe wrappers report a bare script name (e.g.
-    # "voice-stt") as argv[0], so re-running python with that argv would have
-    # python try to open "voice-stt" as a file. Re-enter via -c instead.
-    os.execvpe(sys.executable, [sys.executable, "-c", "from host.stt.cli import main; main()"], env)
+    # Why not os.execvpe? On Windows, os.exec* goes through the CRT, which
+    # joins argv with spaces *without* Windows-style quoting -- so an arg with
+    # spaces (like `-c "from host.stt.cli import main; main()"`) arrives at
+    # the child python split into separate tokens (`-c`, `from`, ...).
+    # subprocess.run uses list2cmdline which quotes correctly. We then exit
+    # with the child's status so this looks like an exec to the caller.
+    import subprocess
+    sys.exit(subprocess.run(
+        [sys.executable, "-c", "from host.stt.cli import main; main()"],
+        env=env,
+    ).returncode)
 
 def main():
     _ensure_windows_cuda_dlls_on_path()
