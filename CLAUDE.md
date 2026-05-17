@@ -39,4 +39,4 @@ Full design: [docs/plans/2026-05-17-voice-assistant-design.md](docs/plans/2026-0
 
 ## Status
 
-- 2026-05-17: Design complete, no implementation yet, repo not yet under git. Next: detailed implementation plan.
+- 2026-05-17: Design complete, no implementation yet. Next: detailed implementation plan.
