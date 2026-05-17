@@ -15,6 +15,8 @@ dependencies = [
   "faster-whisper>=1.0",
   "kokoro-onnx>=0.5",          # 0.5.x is the version verified in Spike B (CPU path)
   "onnxruntime>=1.20",         # CPU ORT only — Spike B chose CPU for TTS
+  "silero-vad>=5.1",           # end-of-utterance detection on the host
+  "torch>=2.2",                # silero-vad runs on torch; CPU build is fine (faster-whisper uses ctranslate2 on GPU)
 ]
 
 [project.optional-dependencies]
