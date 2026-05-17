@@ -36,3 +36,7 @@ def main() -> None:
     ap.add_argument("--url", default=None, help="TTS server URL (defaults to $VOICE_TTS_URL or localhost:8002)")
     args = ap.parse_args()
     sys.exit(speak(args.text, url=args.url))
+
+
+if __name__ == "__main__":
+    main()

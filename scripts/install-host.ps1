@@ -39,9 +39,9 @@ $venvPython = Join-Path $Root ".venv\Scripts\python.exe"
 Write-Host "==> Bootstrapping pip + uv in .venv"
 & $venvPython -m pip install --quiet --upgrade pip uv
 
-# 4. Install host extras (with CUDA wheels) and dev tools
-Write-Host "==> Installing dependencies (.[host-cuda,dev]) -- slow first time"
-& $venvPython -m uv pip install -e ".[host-cuda,dev]"
+# 4. Install host runtime + CUDA wheels + dev tools
+Write-Host "==> Installing dependencies (.[host,host-cuda,dev]) -- slow first time"
+& $venvPython -m uv pip install -e ".[host,host-cuda,dev]"
 if ($LASTEXITCODE -ne 0) { throw "uv pip install failed" }
 
 # 5. Fetch Kokoro voice model files into the repo root if not present

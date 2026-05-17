@@ -45,3 +45,7 @@ def main():
     host = os.environ.get("VOICE_CLAUDE_HOST", "127.0.0.1")
     port = int(os.environ.get("VOICE_CLAUDE_PORT", "8003"))
     uvicorn.run(build_app(process, store), host=host, port=port)
+
+
+if __name__ == "__main__":
+    main()
