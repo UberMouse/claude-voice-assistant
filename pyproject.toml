@@ -38,6 +38,11 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["host", "vm"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"vm/workspace_template/CLAUDE.md" = "vm/workspace_template/CLAUDE.md"
+"vm/workspace_template/.claude/settings.json" = "vm/workspace_template/.claude/settings.json"
+"vm/workspace_template/notes/.gitkeep" = "vm/workspace_template/notes/.gitkeep"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
