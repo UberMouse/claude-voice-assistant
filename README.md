@@ -4,9 +4,19 @@ A push-to-talk voice interface to Claude Code.
 
 ## Status
 
+- **Phase 1 MVP: working end-to-end (2026-05-17).** F3 → STT → Claude → `speak` → TTS round trip proven on Windows host + NixOS VM.
 - Phase 0 spikes: see `docs/spikes/`
-- Phase 1 MVP: see `docs/plans/2026-05-17-voice-assistant-plan.md`
+- Phase 1 MVP plan: see `docs/plans/2026-05-17-voice-assistant-plan.md`
 - Design: see `docs/plans/2026-05-17-voice-assistant-design.md`
+
+## Next
+
+- **Phase 1.5 — true press-and-hold.** Replace the fixed `VOICE_CAPTURE_SECS=5` window with start-on-press / stop-on-release; today the hotkey only debounces.
+- **Phase 1.5 — conversational long-press mode.** Long-press hands the mic over to a VAD-driven turn-taking loop sharing the same Claude session.
+- **Daemon: stream `speak` calls live.** Right now the orchestrator waits for `/ask` to return before going idle; partial `speak` invocations during a long turn could play sooner if `/ask` streamed.
+- **Permission-mode hardening.** `Bash(speak:*)` works because of the workspace allowlist; revisit whether we need `--permission-mode` for safety once we add more tools.
+- **Rate-limit surfacing.** Daemon already parses `rate_limit_event`; expose via `speak "five-hour limit resets at HH:MM"` when the user asks.
+- **Docs polish.** Make `VOICE_TTS_URL` on the VM side more prominent in `docs/windows-setup.md` — forgetting it is the most common cause of silent failures.
 
 ## Quick start (dev)
 
