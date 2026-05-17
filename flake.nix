@@ -14,8 +14,10 @@
             portaudio
             pulseaudio
             pkg-config
-            linuxHeaders
           ];
+          # pynput pulls in evdev on Linux, whose C extension needs <linux/input.h>.
+          # uv/pip run outside Nix's build sandbox, so we expose the headers via CPATH below.
+          nativeBuildInputs = with pkgs; [ linuxHeaders ];
           shellHook = ''
             export LD_LIBRARY_PATH="${pkgs.portaudio}/lib:${pkgs.stdenv.cc.cc.lib}/lib:$LD_LIBRARY_PATH"
             export CPATH="${pkgs.linuxHeaders}/include:$CPATH"
