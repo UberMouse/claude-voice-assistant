@@ -1,0 +1,37 @@
+[Unit]
+Description=Claude voice assistant daemon (VM-side wrapper around `claude --print`)
+Documentation=https://github.com/taylorl/claude-voice-assistant
+# Wait for the network so the daemon's outbound /speak calls (to the Windows
+# host's TTS server) can resolve at startup.
+After=network-online.target
+Wants=network-online.target
+# Cap restart storms; if it dies more than 5 times in 60s, give up so we
+# stop spamming journalctl. (These keys live in [Unit], not [Service].)
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+# `~/.local/bin/voice-claude-daemon` is the editable-install shim that
+# scripts/install-vm.sh creates. Its shebang points at uv's isolated tool
+# venv interpreter, so no PATH gymnastics needed here.
+ExecStart=%h/.local/bin/voice-claude-daemon
+
+# Per-machine config lives outside git. The leading `-` makes the file
+# optional so the service can start with sensible defaults even before the
+# user creates one. See scripts/voice-daemon.env.example.
+EnvironmentFile=-%h/.config/voice-assistant/daemon.env
+
+# Bind to all interfaces by default so the Windows orchestrator can reach
+# this daemon over the VM's LAN address. Override in daemon.env if needed.
+Environment=VOICE_CLAUDE_HOST=0.0.0.0
+
+Restart=on-failure
+RestartSec=3
+
+# Hygiene: surface stdout/stderr to journalctl --user -u claude-voice-daemon.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
