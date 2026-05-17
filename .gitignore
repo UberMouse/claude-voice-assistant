@@ -7,5 +7,7 @@ result
 result-*
 *.wav
 *.mp3
+!tests/fixtures/*.wav
+!tests/fixtures/*.mp3
 models/
 docs/spikes/*.local.md

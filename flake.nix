@@ -14,6 +14,7 @@
             portaudio
             pulseaudio
             pkg-config
+            espeak-ng  # generates STT test fixtures
           ];
           # pynput pulls in evdev on Linux, whose C extension needs <linux/input.h>.
           # uv/pip run outside Nix's build sandbox, so we expose the headers via CPATH below.

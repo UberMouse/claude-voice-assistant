@@ -4,6 +4,7 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
   "fastapi>=0.115",
+  "python-multipart>=0.0.9",   # FastAPI multipart form parsing (UploadFile)
   "uvicorn[standard]>=0.30",
   "httpx>=0.27",
   "pydantic>=2.8",
@@ -25,7 +26,7 @@ host-cuda = ["nvidia-cublas-cu12", "nvidia-cudnn-cu12"]
 
 [project.scripts]
 voice-orchestrator = "host.orchestrator.cli:main"
-voice-stt = "host.stt.server:main"
+voice-stt = "host.stt.cli:main"
 voice-tts = "host.tts.server:main"
 voice-claude-daemon = "vm.claude_daemon.server:main"
 speak = "vm.speak.cli:main"
