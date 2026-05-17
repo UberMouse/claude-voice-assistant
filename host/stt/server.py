@@ -31,7 +31,8 @@ def build_app(model_name: str = "distil-large-v3", device: str = "auto") -> Fast
 
     @app.post("/transcribe")
     async def transcribe(audio: UploadFile = File(...)):
-        if not audio.filename.lower().endswith((".wav", ".flac", ".mp3", ".ogg")):
+        filename = (audio.filename or "").lower()
+        if not filename.endswith((".wav", ".flac", ".mp3", ".ogg")):
             raise HTTPException(400, "unsupported audio format")
         raw = await audio.read()
         try:
