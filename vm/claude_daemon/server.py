@@ -44,13 +44,3 @@ def build_app(process: ClaudeProcess, store: SessionStore) -> FastAPI:
         return {"ok": True, "result_text": text}
 
     return app
-
-
-def main():
-    """Entry-point shim: pyproject's `voice-claude-daemon` script points here.
-
-    The actual main lives in `cli.py` (per Task 7 spec); we re-export it so the
-    existing entry point in pyproject.toml keeps working without modification.
-    """
-    from .cli import main as _main
-    _main()

@@ -28,7 +28,7 @@ host-cuda = ["nvidia-cublas-cu12", "nvidia-cudnn-cu12"]
 voice-orchestrator = "host.orchestrator.cli:main"
 voice-stt = "host.stt.cli:main"
 voice-tts = "host.tts.cli:main"
-voice-claude-daemon = "vm.claude_daemon.server:main"
+voice-claude-daemon = "vm.claude_daemon.cli:main"
 speak = "vm.speak.cli:main"
 
 [build-system]
