@@ -14,7 +14,7 @@ async def amain():
     stt_url    = os.environ.get("VOICE_STT_URL",    "http://127.0.0.1:8001")
     tts_url    = os.environ.get("VOICE_TTS_URL",    "http://127.0.0.1:8002")
     claude_url = os.environ.get("VOICE_CLAUDE_URL", "http://127.0.0.1:8003")
-    hotkey     = os.environ.get("VOICE_HOTKEY",     "f8")
+    hotkey     = os.environ.get("VOICE_HOTKEY",     "f3")
     mic_name   = os.environ.get("VOICE_MIC_NAME")  # substring match, Spike A
 
     rec = Recorder(device_name=mic_name)

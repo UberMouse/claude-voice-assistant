@@ -10,7 +10,7 @@
 #
 # Optional:
 #   VOICE_TTS_HOST   = 0.0.0.0   # default here (so the VM can reach the TTS server)
-#   VOICE_HOTKEY     = f8
+#   VOICE_HOTKEY     = f3
 #   VOICE_CAPTURE_SECS = 5
 #
 # DEBUG-TAG: run-host
@@ -40,13 +40,15 @@ function Start-VoiceService {
   }
   # NOTE: do not put `;` inside the -Command string passed to wt.exe -- wt
   # interprets `;` as a tab separator and you get extra empty tabs.
+  # Each tab must start in $Root so voice-tts can find kokoro-v1.0.onnx /
+  # voices-v1.0.bin via their default relative paths.
   if (Get-Command wt.exe -ErrorAction SilentlyContinue) {
     Start-Process wt.exe -ArgumentList @(
-      "-w", "0", "new-tab", "--title", $Title,
+      "-w", "0", "new-tab", "--title", $Title, "-d", "$Root",
       "powershell", "-NoExit", "-Command", "& '$exePath'"
     )
   } else {
-    Start-Process powershell -ArgumentList @(
+    Start-Process powershell -WorkingDirectory $Root -ArgumentList @(
       "-NoExit", "-Command", "& '$exePath'"
     )
   }

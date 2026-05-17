@@ -39,7 +39,7 @@ class HotkeyDispatcher:
         self._on_event(kind)
 
 def run_pynput(key: str, dispatcher: HotkeyDispatcher) -> None:
-    """Blocking pynput loop. Maps key (e.g. 'f8') to the dispatcher."""
+    """Blocking pynput loop. Maps key (e.g. 'f3') to the dispatcher."""
     from pynput import keyboard
 
     target_key = getattr(keyboard.Key, key.lower(), None)

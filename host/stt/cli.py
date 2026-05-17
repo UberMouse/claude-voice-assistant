@@ -32,8 +32,11 @@ def _ensure_windows_cuda_dlls_on_path() -> None:
     new_path = os.pathsep.join(extra + [os.environ.get("PATH", "")])
     env = {**os.environ, "PATH": new_path, "VOICE_STT_CUDA_PREFIXED": "1"}
     # On Windows, os.execvpe replaces this process so subsequent loader calls
-    # see the prefixed PATH from process start.
-    os.execvpe(sys.executable, [sys.executable, *sys.argv], env)
+    # see the prefixed PATH from process start. We can't use sys.argv here:
+    # pip/uv console-script .exe wrappers report a bare script name (e.g.
+    # "voice-stt") as argv[0], so re-running python with that argv would have
+    # python try to open "voice-stt" as a file. Re-enter via -c instead.
+    os.execvpe(sys.executable, [sys.executable, "-c", "from host.stt.cli import main; main()"], env)
 
 def main():
     _ensure_windows_cuda_dlls_on_path()
