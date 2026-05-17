@@ -16,13 +16,17 @@
 - File paths are repo-relative. The repo root is `/home/taylorl/code/claude-voice-assistant/`.
 - Service URLs are config-driven via env vars from day one — no hardcoded `localhost`.
 
+> **Status (2026-05-17):** Phase 0 spikes A, B, C, **and D** are complete (see `docs/spikes/`). Findings folded into the design (`docs/plans/2026-05-17-voice-assistant-design.md`) and into Phase 1 tasks below. The most consequential change: Task 7 (Claude wrapper daemon) is rewritten around a **long-lived `claude` subprocess speaking stream-json**, replacing the original `--print --resume`-per-call model. Other carry-overs: Windows STT launcher must `PATH`-prefix nvidia DLL dirs (Spike B); TTS runs on CPU and drops `onnxruntime-gpu` (Spike B); `Recorder` selects devices by name substring rather than index (Spike A).
+
 ---
 
-## Phase 0: De-risking Spikes
+## Phase 0: De-risking Spikes ✅ all complete
 
-Three things need verification before we invest in the full MVP. Each spike is timeboxed and exploratory — record findings in `docs/spikes/`, not the codebase.
+Four spikes ran instead of the three originally planned (Spike D added once Spike C surfaced the ~5 s CLI cold-start tax on `claude --print`). All findings live under `docs/spikes/`.
 
-### Spike A: Windows audio capture / playback sanity check
+### Spike A: Windows audio capture / playback sanity check ✅ done
+
+**Outcome:** `sounddevice`/PortAudio works on Windows. Pin devices by name substring, not index (indices shuffle when Bluetooth devices come/go). See `docs/spikes/spike-a-windows-audio.md`. Carries into Task 4 below.
 
 **Goal:** Confirm `sounddevice` on Windows enumerates the user's mic and speakers and round-trips audio with sub-300ms latency. Windows audio is well-trodden ground — this is a sanity check, not a full investigation.
 
@@ -45,7 +49,9 @@ Three things need verification before we invest in the full MVP. Each spike is t
 
 ---
 
-### Spike B: CUDA on Windows with faster-whisper and Kokoro
+### Spike B: CUDA on Windows with faster-whisper and Kokoro ✅ done (with caveat)
+
+**Outcome:** STT (distil-large-v3) on GPU = 288 ms for a 3-second clip. TTS on CPU at 0.27× realtime steady-state — chose CPU because `kokoro_onnx==0.5.0` doesn't expose ORT `providers` cleanly. Critical Windows quirk: ctranslate2's native loader ignores `os.add_dll_directory()`; **the host STT launcher must prepend every `site-packages/nvidia/*/bin` to `PATH` before Python starts**. See `docs/spikes/spike-b-cuda-windows.md`. Carries into Task 2 (STT launcher) and Task 3 (TTS uses CPU; drop `onnxruntime-gpu`).
 
 **Goal:** Confirm both models run on the RTX 4090 from a stock Windows Python install, with acceptable latency. Identify the exact PyTorch+CUDA wheel combo we'll pin.
 
@@ -69,7 +75,9 @@ Three things need verification before we invest in the full MVP. Each spike is t
 
 ---
 
-### Spike C: `claude --print --resume` behavior
+### Spike C: `claude --print --resume` behavior ✅ done
+
+**Outcome:** Session continuity works. `--session-id <uuid>` pre-seeds the id (we don't have to scrape it). `--resume <unknown-uuid>` errors hard rather than creating — daemon must use `--session-id` on first launch and `--resume` thereafter, with a fallback when `--resume` errors. Per-call wall time was 6.5–7.9 s, of which ~5 s is CLI cold-start (Node.js startup, plugin sync, auto-memory load). 10-call burst showed no rate-limit issues at this depth. Session JSONL is stored at `~/.claude/projects/<cwd-encoded>/<id>.jsonl` — **the daemon must `chdir` into a stable workspace before each spawn**. See `docs/spikes/spike-c-claude-print.md`. The ~5 s cold-start tax motivated Spike D below.
 
 **Goal:** Confirm Claude Code's CLI supports the session model we want (persistent context across one-shot invocations) and measure first-token latency and any subscription-plan friction.
 
@@ -94,7 +102,15 @@ Three things need verification before we invest in the full MVP. Each spike is t
 
 ---
 
-**Phase 0 gate:** Read all three spike docs together. If any blocks the design, update the design doc before starting Phase 1.
+### Spike D: persistent `claude --print` with stream-json I/O ✅ done
+
+**Outcome:** Decisive win. A single long-lived `claude --print --input-format=stream-json --output-format=stream-json --verbose` subprocess accepts multiple user messages over its lifetime, preserves context, and **drops warm-turn wall time from 6.5–7.9 s to 1.5–2.8 s** (3–5× speedup). The CLI cold-start tax is paid once per daemon lifetime instead of per request. Bonus: the stream emits a `rate_limit_event` with the full Pro/Max state (`five_hour` window, reset timestamps, overage status) — the daemon can warn the user before a hard 429. Input envelope: `{"type":"user","message":{"role":"user","content":"..."}}\n` per line on stdin. End-of-turn signal: `{"type":"result", ...}\n` on stdout. Canonical session id is read from the first `system/init` event in the stream. See `docs/spikes/spike-d-claude-stream.md`. Reference implementation: `scripts/spike-d-claude-stream.py`.
+
+**Implication for Phase 1:** Task 7 (the Claude wrapper daemon) is rewritten around this model rather than the original "shell out to `claude --print` per request". The HTTP boundary (`POST /ask`) is unchanged.
+
+---
+
+**Phase 0 gate:** ✅ All four spike docs are committed and the design doc has been updated. Proceed to Phase 1.
 
 ---
 
@@ -162,11 +178,16 @@ dependencies = [
   "soundfile>=0.12",
   "pynput>=1.7",
   "faster-whisper>=1.0",
-  "kokoro-onnx>=0.3",
+  "kokoro-onnx>=0.5",          # 0.5.x is the version verified in Spike B (CPU path)
+  "onnxruntime>=1.20",         # CPU ORT only — Spike B chose CPU for TTS
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.6", "respx>=0.21"]
+# Windows-host extras (CUDA DLLs for faster-whisper STT). Install on the
+# Windows host venv only: `uv pip install -e '.[host-cuda]'`.
+# nvidia-cuda-runtime-cu12 is pulled transitively per Spike B.
+host-cuda = ["nvidia-cublas-cu12", "nvidia-cudnn-cu12"]
 
 [project.scripts]
 voice-orchestrator = "host.orchestrator.cli:main"
@@ -336,11 +357,44 @@ def build_app(model_name: str = "distil-large-v3", device: str = "auto") -> Fast
 
 ```python
 import os
+import sys
 import logging
 import uvicorn
 from .server import build_app
 
+# DEBUG-TAG: stt-server
+
+def _ensure_windows_cuda_dlls_on_path() -> None:
+    """Spike B finding: ctranslate2's native loader on Windows ignores
+    os.add_dll_directory(). Pip-installed nvidia DLLs (cublas, cudnn, ...) live
+    in `site-packages/nvidia/*/bin` and must be on PATH *before* Python starts
+    or the loader can't find them. We re-exec ourselves once with PATH prefixed
+    so subsequent imports of faster_whisper/ctranslate2 succeed.
+
+    No-op on non-Windows. No-op if we've already re-exec'd (guard env var).
+    """
+    if sys.platform != "win32" or os.environ.get("VOICE_STT_CUDA_PREFIXED") == "1":
+        return
+    import site
+    extra = []
+    for site_dir in site.getsitepackages() + [site.getusersitepackages()]:
+        nvidia_root = os.path.join(site_dir, "nvidia")
+        if not os.path.isdir(nvidia_root):
+            continue
+        for pkg in os.listdir(nvidia_root):
+            bin_dir = os.path.join(nvidia_root, pkg, "bin")
+            if os.path.isdir(bin_dir):
+                extra.append(bin_dir)
+    if not extra:
+        return
+    new_path = os.pathsep.join(extra + [os.environ.get("PATH", "")])
+    env = {**os.environ, "PATH": new_path, "VOICE_STT_CUDA_PREFIXED": "1"}
+    # On Windows, os.execvpe replaces this process so subsequent loader calls
+    # see the prefixed PATH from process start.
+    os.execvpe(sys.executable, [sys.executable, *sys.argv], env)
+
 def main():
+    _ensure_windows_cuda_dlls_on_path()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     model = os.environ.get("VOICE_STT_MODEL", "distil-large-v3")
     device = os.environ.get("VOICE_STT_DEVICE", "auto")
@@ -348,6 +402,8 @@ def main():
     port = int(os.environ.get("VOICE_STT_PORT", "8001"))
     uvicorn.run(build_app(model, device), host=host, port=port)
 ```
+
+> **Spike B follow-up:** the `_ensure_windows_cuda_dlls_on_path()` re-exec is the in-process equivalent of the `.ps1` launcher pattern verified in the spike. If the re-exec proves flaky (e.g. with frozen Python builds), fall back to a `scripts/voice-stt.ps1` wrapper that sets `PATH` before calling `voice-stt`. The dev-VM (Linux) test path is unaffected: function is a no-op when `sys.platform != "win32"`.
 
 **Step 5: Run the test to verify it passes**
 
@@ -671,11 +727,28 @@ def encode_wav(samples: np.ndarray, sample_rate: int = DEFAULT_SAMPLE_RATE) -> b
     sf.write(buf, samples, sample_rate, subtype="FLOAT", format="WAV")
     return buf.getvalue()
 
+def resolve_input_device(name_substring: Optional[str]) -> Optional[int]:
+    """Spike A finding: Windows reorders device indices when Bluetooth devices
+    come/go. Pin by name substring instead. Returns a device index or None
+    (= sounddevice's default)."""
+    if not name_substring:
+        return None
+    needle = name_substring.lower()
+    for i, d in enumerate(sd.query_devices()):
+        if d["max_input_channels"] > 0 and needle in d["name"].lower():
+            log.info("audio-capture: matched input %r -> device %d (%s)", name_substring, i, d["name"])
+            return i
+    log.warning("audio-capture: no input device matched %r; falling back to default", name_substring)
+    return None
+
 class Recorder:
     """Push-to-talk recorder. start() opens stream, stop() returns the captured audio."""
 
-    def __init__(self, sample_rate: int = DEFAULT_SAMPLE_RATE):
+    def __init__(self, sample_rate: int = DEFAULT_SAMPLE_RATE,
+                 device_name: Optional[str] = None):
         self.sample_rate = sample_rate
+        self.device_name = device_name
+        self._device_index = resolve_input_device(device_name)
         self._chunks: list[np.ndarray] = []
         self._stream: Optional[sd.InputStream] = None
         self._lock = threading.Lock()
@@ -687,11 +760,12 @@ class Recorder:
             self._chunks.append(indata.copy().flatten())
 
     def start(self) -> None:
-        log.info("audio-capture: start sr=%d", self.sample_rate)
+        log.info("audio-capture: start sr=%d device=%r", self.sample_rate, self._device_index)
         self._chunks = []
         self._stream = sd.InputStream(
             samplerate=self.sample_rate, channels=1,
             dtype="float32", callback=self._callback,
+            device=self._device_index,
         )
         self._stream.start()
 
@@ -1045,8 +1119,9 @@ async def amain():
     tts_url    = os.environ.get("VOICE_TTS_URL",    "http://127.0.0.1:8002")
     claude_url = os.environ.get("VOICE_CLAUDE_URL", "http://127.0.0.1:8003")
     hotkey     = os.environ.get("VOICE_HOTKEY",     "f8")
+    mic_name   = os.environ.get("VOICE_MIC_NAME")  # substring match, Spike A
 
-    rec = Recorder()
+    rec = Recorder(device_name=mic_name)
     stt = SttHttpClient(stt_url)
     tts = TtsHttpClient(tts_url)
     claude = ClaudeHttpClient(claude_url)
@@ -1098,24 +1173,38 @@ git commit -m "feat(orchestrator): one-shot state machine + HTTP clients + runne
 
 ---
 
-### Task 7: Claude wrapper daemon (VM)
+### Task 7: Claude wrapper daemon (long-lived stream-json subprocess)
 
-**Goal:** A FastAPI service that turns `POST /ask` into a subprocess call to `claude --print --resume <session-id>`. Persists session ID across requests in `~/.local/state/voice-assistant/session-id`.
+**Goal:** A FastAPI service that owns **one long-lived `claude --print` subprocess** for the daemon's lifetime, talks to it over stdin/stdout using stream-json envelopes, and exposes `POST /ask` to the orchestrator. Reference implementation: `scripts/spike-d-claude-stream.py`.
+
+Subprocess command line (Spike D):
+```
+claude --print \
+       --input-format=stream-json \
+       --output-format=stream-json \
+       --verbose \
+       [--resume <persisted-id>]
+```
+
+Three responsibilities split across modules:
+- `session.py` — persist the canonical session id (from the first `system/init` event) to disk so we can `--resume` after daemon restarts.
+- `process.py` — own the subprocess: spawn, write user messages, read stdout JSON lines until a `type=result`, track `rate_limit_event`, restart on EOF/crash with a fallback when `--resume` fails.
+- `server.py` — FastAPI glue: `POST /ask`, `GET /health`, `GET /status`. Serializes turns through `process.ask()`.
 
 **Files:**
-- Create: `vm/claude_daemon/server.py`
 - Create: `vm/claude_daemon/session.py`
+- Create: `vm/claude_daemon/process.py`
+- Create: `vm/claude_daemon/server.py`
 - Create: `vm/claude_daemon/cli.py`
-- Create: `tests/vm/claude_daemon/test_server.py`
 - Create: `tests/vm/claude_daemon/test_session.py`
+- Create: `tests/vm/claude_daemon/test_process.py`
+- Create: `tests/vm/claude_daemon/test_server.py`
 
-**Step 1: Failing test for session persistence**
+**Step 1: Failing tests for session store**
 
 `tests/vm/claude_daemon/test_session.py`:
 
 ```python
-import os
-from pathlib import Path
 from vm.claude_daemon.session import SessionStore
 
 def test_session_read_write(tmp_path):
@@ -1125,22 +1214,14 @@ def test_session_read_write(tmp_path):
     assert store.read() == "abc-123"
 
 def test_session_corrupt_file_returns_none(tmp_path):
-    p = tmp_path / "sess"
-    p.write_text("")
-    store = SessionStore(p)
-    assert store.read() is None
+    p = tmp_path / "sess"; p.write_text("")
+    assert SessionStore(p).read() is None
 ```
 
-**Step 2: Run, fail**
-
-Expected: FAIL.
-
-**Step 3: Implement session store**
-
-`vm/claude_daemon/session.py`:
+**Step 2: Implement `session.py`**
 
 ```python
-"""Persist Claude session IDs across requests."""
+"""Persist Claude session IDs across daemon restarts."""
 from __future__ import annotations
 import logging
 from pathlib import Path
@@ -1149,7 +1230,6 @@ from typing import Optional
 log = logging.getLogger(__name__)
 
 # DEBUG-TAG: claude-daemon
-# Grep: grep -E "claude-daemon"
 
 class SessionStore:
     def __init__(self, path: Path):
@@ -1165,64 +1245,245 @@ class SessionStore:
     def write(self, session_id: str) -> None:
         self.path.write_text(session_id + "\n")
         log.info("claude-daemon: session id persisted: %s", session_id)
+
+    def clear(self) -> None:
+        if self.path.exists():
+            self.path.unlink()
+        log.info("claude-daemon: session id cleared")
 ```
 
-**Step 4: Failing test for the server (subprocess mocked)**
+Run: `pytest tests/vm/claude_daemon/test_session.py -v` → PASS.
 
-`tests/vm/claude_daemon/test_server.py`:
+**Step 3: Failing tests for the subprocess wrapper**
+
+`tests/vm/claude_daemon/test_process.py` — drives the real wrapper against a tiny fake "claude" binary that speaks the stream-json protocol:
 
 ```python
 import asyncio
-import json
-from unittest.mock import AsyncMock
-from fastapi.testclient import TestClient
-from vm.claude_daemon.server import build_app
-from vm.claude_daemon.session import SessionStore
+import pytest
+from vm.claude_daemon.process import ClaudeProcess
 
-class FakeRunner:
-    def __init__(self):
-        self.calls = []
-        self.next_session_id = "new-sid"
-        self.next_stdout = json.dumps({"session_id": "new-sid", "result": "ok"})
-    async def run(self, text, session_id):
-        self.calls.append((text, session_id))
-        return self.next_stdout
+FAKE_CLAUDE = '''#!/usr/bin/env python3
+import json, sys
+sid = "fake-sid-001"
+def emit(o): print(json.dumps(o), flush=True)
+emit({"type":"system","subtype":"init","session_id":sid})
+emit({"type":"rate_limit_event",
+      "rate_limit_info":{"status":"allowed","rateLimitType":"five_hour"}})
+for line in sys.stdin:
+    obj = json.loads(line)
+    content = obj["message"]["content"]
+    emit({"type":"assistant","message":{"role":"assistant","content":"...thinking..."}})
+    emit({"type":"result","result":"answered:"+content,
+          "duration_ms":42,"session_id":sid})
+'''
 
-def test_ask_calls_runner_and_persists_session(tmp_path):
-    runner = FakeRunner()
-    store = SessionStore(tmp_path / "sid")
-    app = build_app(runner=runner, store=store)
-    client = TestClient(app)
-    r = client.post("/ask", json={"text": "hi", "mode": "oneshot"})
-    assert r.status_code == 200
-    assert runner.calls == [("hi", None)]
-    assert store.read() == "new-sid"
-    # Second call reuses session
-    client.post("/ask", json={"text": "again", "mode": "oneshot"})
-    assert runner.calls[-1] == ("again", "new-sid")
+@pytest.fixture
+def fake_claude(tmp_path):
+    p = tmp_path / "fake-claude"
+    p.write_text(FAKE_CLAUDE)
+    p.chmod(0o755)
+    return p
+
+@pytest.mark.asyncio
+async def test_process_round_trip(fake_claude, tmp_path):
+    persisted = []
+    proc = ClaudeProcess(workdir=tmp_path, binary=str(fake_claude))
+    await proc.ensure_alive(resume_id=None)
+    out1 = await proc.ask("hello", persist_session_id=persisted.append)
+    out2 = await proc.ask("again", persist_session_id=persisted.append)
+    assert out1 == "answered:hello"
+    assert out2 == "answered:again"
+    assert proc.session_id == "fake-sid-001"
+    assert persisted == ["fake-sid-001"]  # only persisted on first init
+    assert proc.last_rate_limit == {"status":"allowed","rateLimitType":"five_hour"}
+    await proc.stop()
 ```
 
-**Step 5: Run, fail**
+Expected: FAIL — module missing.
 
-Expected: FAIL.
-
-**Step 6: Implement runner + server**
-
-`vm/claude_daemon/server.py`:
+**Step 4: Implement `process.py`**
 
 ```python
-"""Claude wrapper daemon. POST /ask -> shells claude --print."""
+"""Long-lived `claude --print` stream-json subprocess.
+
+Spike-D model: one subprocess for the daemon's lifetime, JSON lines in, JSON
+lines out. Each turn is serialized through an asyncio.Lock — a single voice
+user is the design assumption."""
 from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
-import shlex
 from pathlib import Path
-from typing import Optional, Protocol
-from fastapi import FastAPI, HTTPException
+from typing import Callable, Optional
+
+log = logging.getLogger(__name__)
+
+# DEBUG-TAG: claude-daemon
+
+class ClaudeProcess:
+    def __init__(self, workdir: Path, binary: str = "claude",
+                 turn_timeout_s: float = 120.0):
+        self.workdir = Path(workdir)
+        self.binary = binary
+        self.turn_timeout_s = turn_timeout_s
+        self._proc: Optional[asyncio.subprocess.Process] = None
+        self._lock = asyncio.Lock()
+        self.session_id: Optional[str] = None
+        self.last_rate_limit: Optional[dict] = None
+
+    async def _spawn(self, resume_id: Optional[str]) -> None:
+        cmd = [self.binary, "--print",
+               "--input-format", "stream-json",
+               "--output-format", "stream-json",
+               "--verbose"]
+        if resume_id:
+            cmd += ["--resume", resume_id]
+        log.info("claude-daemon: spawn %s (cwd=%s)", " ".join(cmd), self.workdir)
+        self._proc = await asyncio.create_subprocess_exec(
+            *cmd, cwd=str(self.workdir),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+    async def ensure_alive(self, resume_id: Optional[str]) -> None:
+        if self._proc and self._proc.returncode is None:
+            return
+        await self._spawn(resume_id)
+        # Spike C: --resume on a stale id errors fast with "No conversation
+        # found". Watch for early exit and retry without --resume.
+        if resume_id is not None:
+            try:
+                await asyncio.wait_for(self._proc.wait(), timeout=2.0)
+                err = (await self._proc.stderr.read()).decode(errors="replace")
+                if "No conversation found" in err:
+                    log.warning("claude-daemon: stale resume id, starting fresh")
+                    await self._spawn(resume_id=None)
+                else:
+                    raise RuntimeError(f"claude exited early: {err[:200]}")
+            except asyncio.TimeoutError:
+                pass  # still alive — good
+
+    async def ask(self, text: str,
+                  persist_session_id: Callable[[str], None]) -> str:
+        async with self._lock:
+            if not (self._proc and self._proc.returncode is None):
+                raise RuntimeError("claude subprocess not alive")
+            envelope = json.dumps({"type": "user",
+                                   "message": {"role": "user", "content": text}}) + "\n"
+            self._proc.stdin.write(envelope.encode())
+            await self._proc.stdin.drain()
+            log.info("claude-daemon: sent user message (%d chars)", len(text))
+
+            loop = asyncio.get_event_loop()
+            deadline = loop.time() + self.turn_timeout_s
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError("turn exceeded budget")
+                line = await asyncio.wait_for(
+                    self._proc.stdout.readline(), timeout=remaining)
+                if not line:
+                    raise RuntimeError("claude closed stdout mid-turn")
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    log.debug("claude-daemon: non-JSON line: %r", line[:200])
+                    continue
+                t = obj.get("type")
+                if t == "system" and obj.get("subtype") == "init":
+                    sid = obj.get("session_id")
+                    if sid and sid != self.session_id:
+                        self.session_id = sid
+                        persist_session_id(sid)
+                elif t == "rate_limit_event":
+                    self.last_rate_limit = obj.get("rate_limit_info")
+                    log.info("claude-daemon: rate_limit %s", self.last_rate_limit)
+                elif t == "result":
+                    return obj.get("result", "")
+
+    async def stop(self) -> None:
+        if not self._proc:
+            return
+        try:
+            if self._proc.stdin:
+                self._proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(self._proc.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            self._proc.terminate()
+            await self._proc.wait()
+```
+
+Run: `pytest tests/vm/claude_daemon/test_process.py -v` → PASS.
+
+**Step 5: Failing test for the server (process mocked)**
+
+`tests/vm/claude_daemon/test_server.py`:
+
+```python
+from fastapi.testclient import TestClient
+from vm.claude_daemon.server import build_app
+from vm.claude_daemon.session import SessionStore
+
+class FakeProcess:
+    def __init__(self):
+        self.session_id = None
+        self.last_rate_limit = None
+        self.asks = []
+        self._resume = None
+    async def ensure_alive(self, resume_id):
+        self._resume = resume_id
+    async def ask(self, text, persist_session_id):
+        self.asks.append(text)
+        if self.session_id is None:
+            self.session_id = "p-sid"
+            persist_session_id("p-sid")
+        return "answered:" + text
+    async def stop(self): pass
+
+def test_ask_persists_and_returns(tmp_path):
+    proc = FakeProcess()
+    store = SessionStore(tmp_path / "sid")
+    app = build_app(process=proc, store=store)
+    with TestClient(app) as client:
+        r = client.post("/ask", json={"text": "hi", "mode": "oneshot"})
+        assert r.status_code == 200
+        assert r.json()["result_text"] == "answered:hi"
+        assert store.read() == "p-sid"
+        client.post("/ask", json={"text": "again", "mode": "oneshot"})
+        assert proc.asks == ["hi", "again"]
+        # ensure_alive was called once via lifespan, with whatever was in the store at startup
+        assert proc._resume is None  # tmp store was empty
+
+def test_status_exposes_rate_limit(tmp_path):
+    proc = FakeProcess()
+    proc.session_id = "abc"
+    proc.last_rate_limit = {"status": "allowed", "rateLimitType": "five_hour"}
+    store = SessionStore(tmp_path / "sid")
+    app = build_app(process=proc, store=store)
+    with TestClient(app) as client:
+        s = client.get("/status").json()
+        assert s["session_id"] == "abc"
+        assert s["rate_limit"]["status"] == "allowed"
+```
+
+Expected: FAIL.
+
+**Step 6: Implement `server.py`**
+
+```python
+"""FastAPI surface over a long-lived ClaudeProcess."""
+from __future__ import annotations
+import logging
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
 from pydantic import BaseModel
 from .session import SessionStore
+from .process import ClaudeProcess
 
 log = logging.getLogger(__name__)
 
@@ -1232,50 +1493,28 @@ class AskRequest(BaseModel):
     text: str
     mode: str = "oneshot"  # "oneshot" | "conversational" — same wiring for MVP
 
-class Runner(Protocol):
-    async def run(self, text: str, session_id: Optional[str]) -> str: ...
+def build_app(process: ClaudeProcess, store: SessionStore) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        await process.ensure_alive(resume_id=store.read())
+        yield
+        await process.stop()
 
-class ClaudeSubprocessRunner:
-    def __init__(self, workdir: Path, binary: str = "claude"):
-        self.workdir = Path(workdir)
-        self.binary = binary
-
-    async def run(self, text: str, session_id: Optional[str]) -> str:
-        cmd = [self.binary, "--print", "--output-format=json"]
-        if session_id:
-            cmd += ["--resume", session_id]
-        cmd += ["--", text]
-        log.info("claude-daemon: %s (cwd=%s)", " ".join(shlex.quote(a) for a in cmd), self.workdir)
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, cwd=str(self.workdir),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            log.error("claude-daemon: claude exited %d: %s", proc.returncode, stderr.decode()[:400])
-            raise HTTPException(502, f"claude failed: {stderr.decode()[:200]}")
-        return stdout.decode()
-
-def build_app(runner: Runner, store: SessionStore) -> FastAPI:
-    app = FastAPI(title="voice-claude-daemon")
+    app = FastAPI(title="voice-claude-daemon", lifespan=lifespan)
 
     @app.get("/health")
     def health():
-        return {"ok": True, "session": store.read()}
+        return {"ok": True, "session_id": process.session_id}
+
+    @app.get("/status")
+    def status():
+        return {"session_id": process.session_id,
+                "rate_limit": process.last_rate_limit}
 
     @app.post("/ask")
     async def ask(req: AskRequest):
-        sid = store.read()
-        out = await runner.run(req.text, sid)
-        # Best-effort: parse JSON output to capture the new session id
-        try:
-            obj = json.loads(out)
-            new_sid = obj.get("session_id")
-            if new_sid:
-                store.write(new_sid)
-        except json.JSONDecodeError:
-            log.warning("claude-daemon: could not parse JSON output")
-        return {"ok": True}
+        text = await process.ask(req.text, store.write)
+        return {"ok": True, "result_text": text}
 
     return app
 ```
@@ -1285,7 +1524,8 @@ def build_app(runner: Runner, store: SessionStore) -> FastAPI:
 ```python
 import os, logging, uvicorn
 from pathlib import Path
-from .server import build_app, ClaudeSubprocessRunner
+from .server import build_app
+from .process import ClaudeProcess
 from .session import SessionStore
 
 def main():
@@ -1293,26 +1533,31 @@ def main():
     workdir = Path(os.environ.get("VOICE_WORKSPACE", str(Path.home() / "voice-assistant")))
     workdir.mkdir(parents=True, exist_ok=True)
     state_dir = Path(os.environ.get("VOICE_STATE_DIR", str(Path.home() / ".local/state/voice-assistant")))
-    runner = ClaudeSubprocessRunner(workdir=workdir)
+    process = ClaudeProcess(workdir=workdir, binary=os.environ.get("VOICE_CLAUDE_BIN", "claude"))
     store = SessionStore(state_dir / "session-id")
     host = os.environ.get("VOICE_CLAUDE_HOST", "127.0.0.1")
     port = int(os.environ.get("VOICE_CLAUDE_PORT", "8003"))
-    uvicorn.run(build_app(runner, store), host=host, port=port)
+    uvicorn.run(build_app(process, store), host=host, port=port)
 ```
 
 **Step 7: Run all daemon tests**
 
 Run: `nix develop --command sh -c ". .venv/bin/activate && pytest tests/vm/claude_daemon -v"`
-Expected: PASS.
+Expected: 5–6 tests passing.
 
 **Step 8: Commit**
 
 ```bash
 git add vm/claude_daemon tests/vm/claude_daemon
-git commit -m "feat(claude-daemon): HTTP wrapper shelling claude --print --resume"
+git commit -m "feat(claude-daemon): long-lived claude --print stream-json subprocess"
 ```
 
 **Debug logging tag:** `claude-daemon`. Grep regex: `claude-daemon`.
+
+**Out of scope for MVP (Phase 1.5 candidates):**
+- Mid-session subprocess respawn (if `claude` dies in the middle of a turn, the daemon currently raises; a respawn-and-retry loop is a small addition once we've seen real-world failures).
+- Streaming partial assistant chunks back to the orchestrator (we'd use `--include-partial-messages` and forward to TTS for true streaming TTS — needs kokoro streaming first).
+- Surfacing `permission_denials` from the result event as a user-facing warning.
 
 ---
 
@@ -1443,6 +1688,10 @@ You are running inside a voice assistant. Each user message is a transcript from
 
 - Save user-requested notes as markdown in `~/voice-assistant/notes/`, filename `YYYY-MM-DD-<slug>.md`.
 - When the user asks "what did I say about X", grep `~/voice-assistant/notes/`.
+
+## Rate-limit awareness
+
+The wrapper daemon you're running inside monitors your subscription's rate-limit state and surfaces it via its `/status` endpoint. If the user asks "am I close to my limit?" or "when does my rate limit reset?", you can answer from your own knowledge of recent traffic — but the authoritative number lives in the daemon, not in your head. A future iteration may inject the current rate-limit snapshot into your context; for now, if asked, say so honestly ("I don't have a live read on the limit — check the daemon's /status endpoint") rather than guessing.
 ```
 
 **Step 2: Write `vm/workspace_template/.claude/settings.json`**
@@ -1618,8 +1867,14 @@ Press F8 and speak. See `docs/smoke-test.md`.
 | `VOICE_STT_DEVICE` | `auto` | stt server |
 | `VOICE_TTS_VOICE` | `af_sarah` | tts server |
 | `VOICE_WORKSPACE` | `~/voice-assistant` | claude daemon |
+| `VOICE_CLAUDE_BIN` | `claude` | claude daemon (override path to the `claude` binary) |
 | `VOICE_HOTKEY` | `f8` | orchestrator |
 | `VOICE_CAPTURE_SECS` | `5` | orchestrator (MVP — fixed capture window) |
+| `VOICE_MIC_NAME` | _unset_ | audio capture (substring match into device name; falls back to default input) |
+
+## Daemon status
+
+The Claude wrapper daemon exposes `GET /status` which returns the current session id and the last `rate_limit_event` snapshot (subscription window, reset timestamps, overage status). Useful when debugging "why did my prompt fail" or eyeballing how close you are to a five-hour cap.
 
 ## Debug logging
 
@@ -1677,7 +1932,7 @@ All MVP components use stdlib logging with a one-tag prefix per component:
 | Audio capture | `audio-capture` | `host/audio/capture.py` |
 | Hotkey | `hotkey` | `host/orchestrator/hotkey.py` |
 | Orchestrator | `orchestrator` | `host/orchestrator/state.py` |
-| Claude daemon | `claude-daemon` | `vm/claude_daemon/server.py`, `vm/claude_daemon/session.py` |
+| Claude daemon (HTTP + subprocess + session) | `claude-daemon` | `vm/claude_daemon/{server,process,session}.py` |
 | Speak CLI | `speak-cli` | `vm/speak/cli.py` |
 
 **Combined grep regex:** `(stt-server|tts-(server|queue)|audio-capture|hotkey|orchestrator|claude-daemon|speak-cli)`

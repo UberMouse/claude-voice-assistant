@@ -1,6 +1,8 @@
 # Voice-Activated Claude Code Assistant — Design
 
-> **Update 2026-05-17:** After investigating GPU access from the dev VM, we chose **Option C: run the host stack as native Python on Windows** rather than NixOS-WSL. The hardware/hypervisor combo (single-GPU desktop, VMWare Workstation, no ESXi) makes both GPU passthrough to the existing VM and the Hyper-V-based WSL2 path unattractive: passthrough is unsupported on Workstation and would steal the host display; enabling WSL2 forces VMWare into WHP slow-mode for the existing dev VM. Option C trades the clean Nix packaging story for an unaffected dev VM and the simplest possible deployment surface. The HTTP wires and the VM side are unchanged.
+> **Update 2026-05-17 (a):** After investigating GPU access from the dev VM, we chose **Option C: run the host stack as native Python on Windows** rather than NixOS-WSL. The hardware/hypervisor combo (single-GPU desktop, VMWare Workstation, no ESXi) makes both GPU passthrough to the existing VM and the Hyper-V-based WSL2 path unattractive: passthrough is unsupported on Workstation and would steal the host display; enabling WSL2 forces VMWare into WHP slow-mode for the existing dev VM. Option C trades the clean Nix packaging story for an unaffected dev VM and the simplest possible deployment surface. The HTTP wires and the VM side are unchanged.
+>
+> **Update 2026-05-17 (b):** Phase 0 spikes complete (A, B, C, D — see `docs/spikes/`). Spike D supersedes the original "shell out to `claude --print --resume` per request" daemon: the VM-side daemon now keeps **one long-lived `claude` subprocess** with stream-json I/O on stdin/stdout, dropping warm-turn latency from 6.5–8 s to 1.5–2.8 s and exposing the Pro/Max `rate_limit_event` inline. STT confirmed at 288 ms on the RTX 4090 (Spike B); TTS pinned to CPU (Spike B). Other findings folded into the implementation plan.
 
 ## Overview
 
@@ -41,11 +43,16 @@ Explicitly **not** a hands-free coding companion. Claude is not pinned to a repo
                                                        │ HTTP
 ┌─ Linux VM (existing NixOS dev env) ──────────────────┼─────────────┐
 │                                                      ▼             │
-│   Claude wrapper daemon ──▶ claude --print --resume <session-id>   │
-│              ▲                                                     │
-│              │  HTTP POST /speak                                   │
-│              │                                                     │
-│           `speak` CLI tool  ──── (hits host TTS server) ───────────┼─▶
+│   Claude wrapper daemon                                            │
+│      │   stdin  ──▶  one long-lived `claude --print                │
+│      │                  --input-format=stream-json                 │
+│      │                  --output-format=stream-json --verbose`     │
+│      │   stdout ◀──  JSON line stream (system/user/assistant/      │
+│      │                rate_limit_event/result events)              │
+│      ▲                                                             │
+│      │  HTTP POST /speak                                           │
+│      │                                                             │
+│   `speak` CLI tool  ──── (hits host TTS server) ───────────────────┼─▶
 │                                                                    │
 │   Workspace: ~/voice-assistant/{notes,CLAUDE.md,...}               │
 │                                                                    │
@@ -85,15 +92,15 @@ This is less elegant than `nix build && wsl --import`, but the moving parts are 
 - `pynput` registers Win32 global hotkeys natively — the AHK shim from the previous design is gone.
 - The VM side is unchanged, so the architectural seam (HTTP wires) is intact.
 
-**Spikes to do before committing:**
-- CUDA-on-Windows: confirm `faster-whisper` and Kokoro run on the 4090 from a stock Python install, measure latency.
-- Mic capture from Python on Windows: confirm `sounddevice` enumerates the user's mic and captures with acceptable latency.
+**Spikes done (2026-05-17):**
+- **A — Windows audio:** `sounddevice`/PortAudio works; pin devices by name substring (Windows reorders indices when Bluetooth devices come/go). See `docs/spikes/spike-a-windows-audio.md`.
+- **B — CUDA on Windows:** `faster-whisper` distil-large-v3 transcribes a 3-second clip in 288 ms on the 4090. Kokoro pinned to CPU (kokoro_onnx 0.5 doesn't expose ORT providers cleanly; CPU steady-state is 0.27× realtime which is fine). Critical: ctranslate2's native loader on Windows ignores `os.add_dll_directory()` — the launcher must prepend `site-packages/nvidia/*/bin` to `PATH` before Python starts. See `docs/spikes/spike-b-cuda-windows.md`.
+- **C — `claude --print --resume`:** Session pinning works, but `--resume <unknown-uuid>` errors hard rather than creating; daemon must use `--session-id` on first launch and `--resume` thereafter. CLI cold-start tax is ~5 s per invocation. See `docs/spikes/spike-c-claude-print.md`.
+- **D — Long-lived `claude` with stream-json:** Beats `--print`-per-call 3–5×. Warm turns 1.5–2.8 s. `rate_limit_event` surfaces inline. This is the daemon model we ship. See `docs/spikes/spike-d-claude-stream.md`.
 
 ## VM side
 
-Unchanged from the prior design:
-
-- **Claude wrapper daemon** — small HTTP service (FastAPI). `POST /ask {"text": "...", "mode": "oneshot"|"conversational"}`. Shells out to `claude --print --output-format=json --resume <session-id> "<text>"`. One systemd unit. Session ID persisted to disk.
+- **Claude wrapper daemon** — small HTTP service (FastAPI). `POST /ask {"text": "...", "mode": "oneshot"|"conversational"}`. Owns **one long-lived `claude` subprocess** spawned at daemon start with `--print --input-format=stream-json --output-format=stream-json --verbose`. Each `/ask` writes a single `{"type":"user","message":{"role":"user","content":<text>}}` JSON line to subprocess stdin and reads stdout JSON lines until a `{"type":"result", ...}` line arrives. **The 5-second CLI cold-start tax is paid once at daemon start, not per request** (Spike D: warm turns drop to 1.5–2.8 s). One systemd unit. Canonical session ID is read from the first `system/init` event in the stream and persisted to disk so the daemon can respawn the subprocess with `--resume <id>` after a crash or restart. `rate_limit_event` lines are drained into a `/status` endpoint so the orchestrator (and voice-Claude itself, via `CLAUDE.md` instructions) can surface "approaching limit" warnings to the user before a hard 429.
 - **`speak` CLI tool** — on `$PATH`. POSTs to host TTS server. Returns immediately; host queues and plays asynchronously.
 - **Workspace** at `~/voice-assistant/`:
   - `notes/` — plain markdown
@@ -101,9 +108,9 @@ Unchanged from the prior design:
   - MCP config for web search and future integrations
   - Settings tuned to skip permission prompts for `speak`, `WebFetch`, edits within the workspace
 
-Claude is invoked from this directory so it picks up `CLAUDE.md` and settings automatically.
+The daemon **must `chdir` into the workspace before spawning the subprocess** so the session JSONL lands in `~/.claude/projects/<workspace-cwd-encoded>/<id>.jsonl` consistently across daemon restarts (Spike C). Claude also picks up the workspace's `CLAUDE.md` and settings automatically because of this cwd.
 
-**Session continuity:** `--resume <session-id>` is shared across one-shot presses (so "what did I just say about X" works across presses); same session reused within a conversational burst. Exact rotation policy deferred.
+**Session continuity:** the same long-lived process serves all turns within a daemon lifetime, so context is shared across all one-shot presses *and* conversational bursts for free. On daemon restart the persisted session id is fed back via `--resume`; if that fails (`No conversation found with session ID …`), the daemon spawns a fresh session and persists the new id from the new `system/init`. Exact rotation policy still deferred.
 
 ## Communication wire
 
@@ -154,19 +161,22 @@ Conversational mode exits on: second button tap, N seconds of silence with no ne
 
 ## Risks and known fallbacks
 
-- **`claude --print` subscription-plan limits**: if Claude Pro/Max rate limits bite, swap the VM wrapper daemon to call the Anthropic API directly via the Agent SDK. HTTP boundary `POST /ask` stays unchanged.
+- **Pro/Max subscription rate limits**: now *partially derisked* — Spike D shows the stream emits a `rate_limit_event` with status (`allowed`/overage/etc.), `rateLimitType`, and reset timestamps. The daemon exposes this on `/status`, and the runtime `CLAUDE.md` can instruct voice-Claude to warn the user when overage status changes. Hard-fallback if we hit ceilings anyway: swap the daemon's subprocess for the Anthropic API via the Agent SDK; the `POST /ask` HTTP boundary stays unchanged.
+- **Long-lived subprocess dies mid-session**: the daemon detects EOF or non-zero exit on the `claude` subprocess, respawns it with `--resume <persisted-session-id>`, and (if `--resume` errors with "No conversation found") falls back to spawning fresh and persisting the new id from `system/init`. Tested behavior, not speculation.
+- **CWD coupling**: the session JSONL is stored under `~/.claude/projects/<cwd-encoded>/`. If the daemon is launched from a different cwd between runs, `--resume` won't find the session. Mitigation: daemon `chdir`'s into the workspace dir before spawn. Integration test asserts the cwd of the spawned subprocess.
 - **Windows Python deployment drift**: without Nix, the host venv can drift over time (Python version mismatches, native deps recompiled, missing CUDA runtime DLLs). Mitigation: pin everything in `pyproject.toml`, document the exact Python and CUDA versions in `docs/host-setup.md`, and ship a `verify-host.ps1` script that checks the install is sane.
-- **CUDA / driver mismatch**: PyTorch wheels are pinned to a specific CUDA version. If the Windows NVIDIA driver is older than the CUDA runtime PyTorch wants, things fail quietly. Mitigation: pin a known-good combo, document it.
-- **Code dev/deploy split**: developing in NixOS and deploying to Windows means platform-specific bugs (path separators, line endings, audio device enumeration differences) can sneak in. Mitigation: a small set of integration tests runnable on Windows after install.
+- **Windows CUDA DLL discoverability**: `ctranslate2`'s native loader on Windows ignores `os.add_dll_directory()` — DLLs are resolved against `PATH` *as set before* Python starts. Mitigation: the host STT service is launched via a wrapper that prepends every `site-packages/nvidia/*/bin` directory to `PATH` before exec'ing Python. Baked into Phase 1.
+- **Code dev/deploy split**: developing in NixOS and deploying to Windows means platform-specific bugs (path separators, line endings, audio device enumeration differences) can sneak in. Mitigation: a small set of integration tests runnable on Windows after install, and devices pinned by name substring rather than index (Spike A).
 
 ## Open questions (deferred to implementation planning)
 
-1. **Session rotation policy** — daily? idle timeout? per topic? Affects how often Claude has to rehydrate context from `notes/`.
+1. **Session rotation policy** — daily? idle timeout? per topic? Affects how often Claude has to rehydrate context from `notes/`. Note: with the long-lived-subprocess daemon, "rotate" means kill the subprocess and respawn without `--resume` — context is otherwise shared for the daemon's full lifetime.
 2. **Barge-in** — can pressing the button mid-TTS interrupt and start a new utterance? Adds duck/cancel logic.
 3. **Confirmation tones** — short audio cues for "listening" / "thinking" / "saved silently".
 4. **Wake-word as a future option** — openWakeWord on CPU, easy bolt-on later.
 5. **Voice selection** — Kokoro preset vs XTTS clone of the user's voice.
 6. **Auth on local HTTP endpoints** — shared secret if anything ever leaves loopback.
-7. **`claude --print` vs Agent SDK from day one** — depends on (1).
+7. ~~**`claude --print` vs Agent SDK from day one**~~ — **closed by Spike D**: long-lived `claude --print` stream-json gives us subscription-plan auth, inline rate-limit visibility, and warm-turn latency in the 1.5–2.8 s range. Agent SDK stays in reserve as the fallback if rate limits actually bite.
 8. **Windows service management** — Task Scheduler vs NSSM vs Startup shortcut. Decide during Phase 2.
 9. **Network reachability** — confirm VM↔host HTTP works on the user's VMWare network setup before assuming it does.
+10. **Permission-denial handling in the stream** — Spike D didn't exercise a tool denial; the `result.permission_denials` field exists but its shape isn't documented yet. Phase-1 integration tests should cover this when we wire up `Bash(speak:*)` allow-list interactions.
