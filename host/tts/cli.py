@@ -7,3 +7,7 @@ def main():
     port = int(os.environ.get("VOICE_TTS_PORT", "8002"))
     voice = os.environ.get("VOICE_TTS_VOICE", "af_sarah")
     uvicorn.run(build_app(voice_default=voice), host=host, port=port)
+
+
+if __name__ == "__main__":
+    main()

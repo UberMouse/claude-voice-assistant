@@ -51,3 +51,7 @@ def main():
     host = os.environ.get("VOICE_STT_HOST", "127.0.0.1")
     port = int(os.environ.get("VOICE_STT_PORT", "8001"))
     uvicorn.run(build_app(model, device), host=host, port=port)
+
+
+if __name__ == "__main__":
+    main()

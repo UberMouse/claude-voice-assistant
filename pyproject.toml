@@ -2,12 +2,20 @@
 name = "claude-voice-assistant"
 version = "0.1.0"
 requires-python = ">=3.12"
+# VM-side runtime deps only. Host (Windows) deps live in the `host` extra.
 dependencies = [
   "fastapi>=0.115",
-  "python-multipart>=0.0.9",   # FastAPI multipart form parsing (UploadFile)
   "uvicorn[standard]>=0.30",
   "httpx>=0.27",
   "pydantic>=2.8",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.6", "respx>=0.21"]
+# Windows-host runtime deps: STT + TTS + mic capture + hotkey + multipart upload.
+# Install on the Windows host venv: `uv pip install -e '.[host,host-cuda]'`.
+host = [
+  "python-multipart>=0.0.9",   # FastAPI multipart form parsing (UploadFile)
   "sounddevice>=0.5",
   "numpy>=2.0",
   "soundfile>=0.12",
@@ -16,18 +24,14 @@ dependencies = [
   "kokoro-onnx>=0.5",          # 0.5.x is the version verified in Spike B (CPU path)
   "onnxruntime>=1.20",         # CPU ORT only — Spike B chose CPU for TTS
 ]
-
-[project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.6", "respx>=0.21"]
-# Windows-host extras (CUDA DLLs for faster-whisper STT). Install on the
-# Windows host venv only: `uv pip install -e '.[host-cuda]'`.
-# nvidia-cuda-runtime-cu12 is pulled transitively per Spike B.
+# CUDA DLL wheels for faster-whisper on Windows. nvidia-cuda-runtime-cu12
+# is pulled transitively per Spike B.
 host-cuda = ["nvidia-cublas-cu12", "nvidia-cudnn-cu12"]
 
+# Only VM-side scripts are exposed as console entry points. Host-side scripts
+# are invoked via `python -m host.{orchestrator,stt,tts}.cli` so a Linux
+# `uv tool install --editable .` doesn't drop inert binaries on PATH.
 [project.scripts]
-voice-orchestrator = "host.orchestrator.cli:main"
-voice-stt = "host.stt.cli:main"
-voice-tts = "host.tts.cli:main"
 voice-claude-daemon = "vm.claude_daemon.cli:main"
 speak = "vm.speak.cli:main"
 

@@ -30,14 +30,17 @@ if (-not $env:VOICE_MIC_NAME) {
   Write-Warning "List devices: .\.venv\Scripts\python.exe -m sounddevice"
 }
 
-$venvBin = Join-Path $Root ".venv\Scripts"
+$venvPython = Join-Path $Root ".venv\Scripts\python.exe"
+if (-not (Test-Path $venvPython)) {
+  throw "Not found: $venvPython (run .\scripts\install-host.ps1 first)"
+}
 
 function Start-VoiceService {
-  param([string]$Title, [string]$Exe)
-  $exePath = Join-Path $venvBin "$Exe.exe"
-  if (-not (Test-Path $exePath)) {
-    throw "Not found: $exePath (run .\scripts\install-host.ps1 first)"
-  }
+  param([string]$Title, [string]$Module)
+  # Host scripts are invoked via `python -m <module>` rather than console
+  # entry points -- only the VM-side scripts (voice-claude-daemon, speak) are
+  # exposed in [project.scripts]. See pyproject.toml.
+  #
   # NOTE: do not put `;` inside the -Command string passed to wt.exe -- wt
   # interprets `;` as a tab separator and you get extra empty tabs.
   # Each tab must start in $Root so voice-tts can find kokoro-v1.0.onnx /
@@ -45,17 +48,17 @@ function Start-VoiceService {
   if (Get-Command wt.exe -ErrorAction SilentlyContinue) {
     Start-Process wt.exe -ArgumentList @(
       "-w", "0", "new-tab", "--title", $Title, "-d", "$Root",
-      "powershell", "-NoExit", "-Command", "& '$exePath'"
+      "powershell", "-NoExit", "-Command", "& '$venvPython' -m $Module"
     )
   } else {
     Start-Process powershell -WorkingDirectory $Root -ArgumentList @(
-      "-NoExit", "-Command", "& '$exePath'"
+      "-NoExit", "-Command", "& '$venvPython' -m $Module"
     )
   }
 }
 
-Start-VoiceService -Title "voice-stt"          -Exe "voice-stt"
-Start-VoiceService -Title "voice-tts"          -Exe "voice-tts"
-Start-VoiceService -Title "voice-orchestrator" -Exe "voice-orchestrator"
+Start-VoiceService -Title "voice-stt"          -Module "host.stt.cli"
+Start-VoiceService -Title "voice-tts"          -Module "host.tts.cli"
+Start-VoiceService -Title "voice-orchestrator" -Module "host.orchestrator.cli"
 
 Write-Host "==> Three services launched. Watch each tab/window for startup logs." -ForegroundColor Green
