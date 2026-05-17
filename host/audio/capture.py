@@ -34,14 +34,32 @@ def encode_wav(samples: np.ndarray, sample_rate: int = DEFAULT_SAMPLE_RATE) -> b
     return buf.getvalue()
 
 
+def refresh_portaudio() -> None:
+    """PortAudio caches the device list at init; without a re-init it never
+    notices mics being plugged/unplugged after the process starts. The
+    underscore-prefixed helpers are sounddevice's documented escape hatch
+    for this case."""
+    try:
+        sd._terminate()
+        sd._initialize()
+    except Exception as e:  # don't let a quirky PortAudio build wedge a press
+        log.warning("audio-capture: PortAudio re-init failed: %s", e)
+
+
 def resolve_input_device(name_substring: Optional[str]) -> Optional[int]:
     """Spike A finding: Windows reorders device indices when Bluetooth devices
     come/go. Pin by name substring instead. Returns a device index or None
-    (= sounddevice's default)."""
+    (= sounddevice's default). If enumeration fails, fall back to default
+    rather than raising."""
     if not name_substring:
         return None
     needle = name_substring.lower()
-    for i, d in enumerate(sd.query_devices()):
+    try:
+        devices = sd.query_devices()
+    except Exception as e:
+        log.error("audio-capture: device enumeration failed: %s", e)
+        return None
+    for i, d in enumerate(devices):
         if d["max_input_channels"] > 0 and needle in d["name"].lower():
             log.info("audio-capture: matched input %r -> device %d (%s)", name_substring, i, d["name"])
             return i
@@ -77,7 +95,6 @@ class Recorder:
             )
         self.sample_rate = sample_rate
         self.device_name = device_name
-        self._device_index = resolve_input_device(device_name)
         self._endpointer = endpointer
         self._vad = vad_scorer
         self._chunks: list[np.ndarray] = []
@@ -126,11 +143,28 @@ class Recorder:
                     return
 
     def start(self) -> None:
+        # Re-enumerate devices every press so the user can plug/unplug the
+        # mic at will without restarting the orchestrator. PortAudio caches
+        # the list at init, so a full re-init is required.
+        refresh_portaudio()
+        device_index = resolve_input_device(self.device_name)
         log.info("audio-capture: start sr=%d device=%r vad=%s",
-                 self.sample_rate, self._device_index, self._endpointer is not None)
+                 self.sample_rate, device_index, self._endpointer is not None)
         self._chunks = []
         self.done_event.clear()
         self._endpoint_result = None
+        # Open the audio stream first — if there's no device at all this is
+        # where it'll fail, and we don't want to leak a VAD worker thread.
+        try:
+            self._stream = sd.InputStream(
+                samplerate=self.sample_rate, channels=1,
+                dtype="float32", callback=self._callback,
+                device=device_index,
+            )
+            self._stream.start()
+        except Exception:
+            self._stream = None
+            raise
         if self._endpointer is not None:
             self._endpointer.reset()
             self._vad.reset()
@@ -138,12 +172,6 @@ class Recorder:
             self._vad_stop.clear()
             self._vad_thread = threading.Thread(target=self._vad_worker, daemon=True)
             self._vad_thread.start()
-        self._stream = sd.InputStream(
-            samplerate=self.sample_rate, channels=1,
-            dtype="float32", callback=self._callback,
-            device=self._device_index,
-        )
-        self._stream.start()
 
     async def wait_for_end(self, *, timeout: float) -> Optional[EndpointResult]:
         """Block until VAD endpointing fires, or timeout. Returns the result
@@ -155,13 +183,21 @@ class Recorder:
         return self._endpoint_result
 
     def stop(self) -> np.ndarray:
-        assert self._stream is not None, "start() must be called first"
-        self._stream.stop()
-        self._stream.close()
-        self._stream = None
+        # Tolerant of stop() after a failed start(): we just return an empty
+        # buffer and let upstream handle the "empty transcript" case.
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception as e:
+                # A mid-recording disconnect can make close() raise; log it
+                # but still return whatever we captured so the cycle ends.
+                log.warning("audio-capture: stream close raised: %s", e)
+            self._stream = None
         if self._vad_thread is not None:
             self._vad_stop.set()
-            self._vad_queue.put(None)
+            if self._vad_queue is not None:
+                self._vad_queue.put(None)
             self._vad_thread.join(timeout=1.0)
             self._vad_thread = None
             self._vad_queue = None

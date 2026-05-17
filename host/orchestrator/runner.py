@@ -48,12 +48,18 @@ async def amain():
     machine = OneShotMachine(recorder=rec, stt=stt, claude=claude, tts=tts)
 
     loop = asyncio.get_event_loop()
+    def _log_future_exc(fut) -> None:
+        # Without this, exceptions in the fire-and-forget press cycle land on
+        # an unawaited future and only surface as a GC-time warning.
+        exc = fut.exception()
+        if exc is not None:
+            log.error("orchestrator: press cycle failed", exc_info=exc)
+
     def on_kind(kind: PressKind):
-        if kind == PressKind.SHORT:
-            asyncio.run_coroutine_threadsafe(_press_release_cycle(machine, rec), loop)
-        else:
+        if kind != PressKind.SHORT:
             log.info("orchestrator: long-press received (conversational mode not implemented yet)")
-            asyncio.run_coroutine_threadsafe(_press_release_cycle(machine, rec), loop)
+        fut = asyncio.run_coroutine_threadsafe(_press_release_cycle(machine, rec), loop)
+        fut.add_done_callback(_log_future_exc)
 
     dispatcher = HotkeyDispatcher(on_event=on_kind)
     log.info("orchestrator: listening on key %s", hotkey)
@@ -65,7 +71,10 @@ async def _press_release_cycle(machine: OneShotMachine, rec: Recorder):
     cap (VOICE_MAX_SECS, default 30s) is enforced by the endpointer, with the
     executor wait timeout below as a belt-and-suspenders. Falls back to a
     fixed window (VOICE_CAPTURE_SECS) when VAD is disabled."""
-    await machine.on_press()
+    if not await machine.on_press():
+        # Recorder didn't start (no mic, or we weren't idle). Abort the cycle
+        # so we don't sit through a 30s wait on a stream that doesn't exist.
+        return
     if rec.has_endpointer:
         max_secs = int(os.environ.get("VOICE_MAX_SECS", "30"))
         result = await rec.wait_for_end(timeout=max_secs + 2)

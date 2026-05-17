@@ -32,13 +32,22 @@ class OneShotMachine:
     tts: TtsClient
     state: State = "idle"
 
-    async def on_press(self) -> None:
+    async def on_press(self) -> bool:
+        """Start recording. Returns True if recording is now in progress; False
+        if the press was ignored (not idle) or the recorder failed to start
+        (e.g. no mic plugged in). On failure we stay in ``idle`` so the next
+        press isn't dropped by the guard above."""
         if self.state != "idle":
             log.warning("orchestrator: press ignored in state %s", self.state)
-            return
+            return False
+        try:
+            self.recorder.start()
+        except Exception:
+            log.exception("orchestrator: recorder failed to start; staying idle")
+            return False
         self.state = "recording"
         log.info("orchestrator: -> recording")
-        self.recorder.start()
+        return True
 
     async def on_release(self) -> None:
         if self.state != "recording":
