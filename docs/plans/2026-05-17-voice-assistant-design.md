@@ -1,5 +1,7 @@
 # Voice-Activated Claude Code Assistant — Design
 
+> **Update 2026-05-17:** After investigating GPU access from the dev VM, we chose **Option C: run the host stack as native Python on Windows** rather than NixOS-WSL. The hardware/hypervisor combo (single-GPU desktop, VMWare Workstation, no ESXi) makes both GPU passthrough to the existing VM and the Hyper-V-based WSL2 path unattractive: passthrough is unsupported on Workstation and would steal the host display; enabling WSL2 forces VMWare into WHP slow-mode for the existing dev VM. Option C trades the clean Nix packaging story for an unaffected dev VM and the simplest possible deployment surface. The HTTP wires and the VM side are unchanged.
+
 ## Overview
 
 A push-to-talk personal voice assistant backed by Claude Code. The user presses a button on their Windows host, speaks, and Claude (running in a Linux VM) responds via speech.
@@ -18,22 +20,22 @@ Explicitly **not** a hands-free coding companion. Claude is not pinned to a repo
 ## Topology
 
 ```
-┌─ Windows 11 Host (RTX 4090) ──────────────────────────────────────┐
+┌─ Windows 11 Host (RTX 4090, Python native) ───────────────────────┐
 │                                                                   │
-│   [Push-to-talk hotkey] ──▶ Orchestrator (in WSL)                 │
-│        (AHK shim)                │                                 │
-│                              ┌───┴────┐                            │
+│   [Push-to-talk hotkey] ──▶ Orchestrator (Python on Windows)      │
+│   (pynput global hook)            │                                │
+│                              ┌────┴───┐                            │
 │                              ▼        ▼                            │
-│                       Mic capture    STT (faster-whisper, GPU)     │
+│                       Mic capture    STT (faster-whisper, CUDA)    │
 │                                       │                            │
 │                              ┌────────┘                            │
 │                              ▼                                     │
 │                       Send text ─────────────────────┐             │
 │                                                      │             │
-│                       TTS (Kokoro/XTTS, GPU)         │             │
+│                       TTS (Kokoro, CUDA)             │             │
 │                              ▲                       │             │
 │                              │                       │             │
-│                       Speaker playback (WSLg → Win)  │             │
+│                       Speaker playback (Windows audio)             │
 │                                                      │             │
 └──────────────────────────────────────────────────────┼─────────────┘
                                                        │ HTTP
@@ -50,53 +52,58 @@ Explicitly **not** a hands-free coding companion. Claude is not pinned to a repo
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-Audio I/O, STT, TTS, and the push-to-talk hotkey all run on the Windows host (RTX 4090). Claude runs in the existing Linux VM. Two HTTP boundaries:
+Audio I/O, STT, TTS, and the push-to-talk hotkey all run natively on the Windows host (no WSL, no extra hypervisor layer). Claude runs in the existing Linux VM. Two HTTP boundaries:
 - Host orchestrator → VM: sends transcript
 - VM `speak` tool → host TTS server: sends text to play
 
-## Host side (Windows + NixOS-WSL)
+## Host side (Windows native Python)
 
-The entire host-side stack is packaged as a **NixOS-WSL distro**, built from a Nix flake in the user's existing NixOS VM and shipped to the Windows host as a tarball.
+The host stack is plain Python 3.12 running directly on Windows, with CUDA via the standard Windows NVIDIA driver and the official PyTorch / `faster-whisper` / Kokoro Windows builds. No WSL, no AutoHotkey shim — `pynput` registers a Win32 global hotkey directly.
 
 **Deploy / update flow:**
-1. `nix build .#nixosConfigurations.voice-host.config.system.build.tarballBuilder` in the VM
-2. `scp` the resulting tarball to the host
-3. `wsl --import voice-host C:\wsl\voice-host nixos.wsl` (first time) or `wsl --import --override` (subsequent)
-4. Atomic rollback by selecting an older NixOS generation
+1. Develop and test in the NixOS VM (this repo) using localhost services.
+2. Push code to a Git remote (GitHub or self-hosted).
+3. On the Windows host (one-time setup): install Python 3.12 + `uv` + Git + NVIDIA driver + CUDA runtime. Clone the repo. Run a small bootstrap script (`scripts/install-host.ps1`) that creates a venv, installs deps, downloads model weights, and registers the four services to start at logon.
+4. Update flow: `git pull` on the host, re-run install script (idempotent), restart services.
 
-**Components inside the WSL distro** (all as systemd units):
-- **Orchestrator** — owns the state machine. Python or Rust.
-- **Mic capture** — PortAudio/`sounddevice` + Silero VAD for end-of-utterance detection in conversational mode.
-- **STT server** — [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper) (CTranslate2-backed Whisper) on GPU. HTTP endpoint. `large-v3` transcribes a 10s clip in sub-second on a 4090.
-- **TTS server** — Kokoro (recommended: fast, low VRAM, good quality) or XTTS-v2 / Coqui (more natural, voice cloning). HTTP endpoint. Plays through host default output via WSLg. Internal queue prevents overlapping playback from rapid `speak` calls.
+This is less elegant than `nix build && wsl --import`, but the moving parts are minimal: one venv, one model cache, one set of services. The repo is the source of truth and updates ride normal Git.
 
-**Why WSL2, not VMWare passthrough:**
-- CUDA-on-WSL is mature (NVIDIA's WSL driver + `nvidia-smi` works inside WSL with stock Windows NVIDIA drivers)
-- WSLg bridges PulseAudio to Windows audio devices automatically — no audio plumbing
-- The whole environment is one Nix-built tarball; reproducible, atomic updates
+**Components on Windows** (each is a Python process):
+- **Orchestrator** — state machine. Owns the hotkey listener.
+- **Mic capture** — `sounddevice` (PortAudio) calling Windows audio. Silero VAD for end-of-utterance in conversational mode.
+- **STT server** — `faster-whisper` on CUDA. HTTP endpoint.
+- **TTS server** — Kokoro (or XTTS) on CUDA. HTTP endpoint. Plays via `sounddevice` to the Windows default output. Internal queue prevents overlap.
 
-**The one Windows-native piece:** a global push-to-talk hotkey shim. Win32 global hotkeys can't be registered from inside WSL. Options:
-1. **AutoHotkey one-liner** (recommended) — `.ahk` script in Startup, ~5 lines. On hotkey down/up, fires `curl http://<wsl-ip>:8000/ptt-down`/`/ptt-up`. Effectively never needs updating.
-2. **Tiny Rust binary** cross-compiled from the VM via `pkgsCross.mingwW64`. Single `.exe`, no runtime.
-3. **Hardware trigger** (foot pedal, Stream Deck) — possible via `usbipd-win`, more setup. Only if a physical button is wanted.
+**Service management** — open question. Three plausible options, decide during Phase 2:
+1. **Windows Task Scheduler** at logon, restart on failure — built in, no extra software.
+2. **NSSM** (Non-Sucking Service Manager) — wraps each Python process as a proper Windows service; cleaner logs, survives logoff.
+3. **Plain Startup shortcut + tmux-style multiplexer** — simplest but no resilience.
+
+**Why this is less bad than it sounds:**
+- Windows CUDA + PyTorch + faster-whisper is the canonical setup; well-documented and stable.
+- Audio on Windows via PortAudio "just works" — no PulseAudio bridge, no WSLg.
+- `pynput` registers Win32 global hotkeys natively — the AHK shim from the previous design is gone.
+- The VM side is unchanged, so the architectural seam (HTTP wires) is intact.
 
 **Spikes to do before committing:**
-- WSLg microphone latency and stability under load
-- CUDA driver-version compatibility between the host's Windows NVIDIA driver and the CUDA libs `nixpkgs` ships (may need a `cudaPackages_12_x` pin)
+- CUDA-on-Windows: confirm `faster-whisper` and Kokoro run on the 4090 from a stock Python install, measure latency.
+- Mic capture from Python on Windows: confirm `sounddevice` enumerates the user's mic and captures with acceptable latency.
 
 ## VM side
 
-- **Claude wrapper daemon** — small HTTP service (e.g. FastAPI). One endpoint: `POST /ask {"text": "...", "mode": "oneshot"|"conversational"}`. Internally shells out to `claude --print --output-format=stream-json --resume <session-id> "<text>"`. Returns when Claude exits. One systemd unit. Session ID persisted to disk.
-- **`speak` CLI tool** — on `$PATH`. Bash one-liner or ~20 line Python script. `POST`s to host TTS server. Returns immediately; the host queues and plays asynchronously so Claude isn't blocked on TTS finishing.
+Unchanged from the prior design:
+
+- **Claude wrapper daemon** — small HTTP service (FastAPI). `POST /ask {"text": "...", "mode": "oneshot"|"conversational"}`. Shells out to `claude --print --output-format=json --resume <session-id> "<text>"`. One systemd unit. Session ID persisted to disk.
+- **`speak` CLI tool** — on `$PATH`. POSTs to host TTS server. Returns immediately; host queues and plays asynchronously.
 - **Workspace** at `~/voice-assistant/`:
-  - `notes/` — plain markdown (future: maybe Obsidian, not designed for now)
-  - `CLAUDE.md` — runtime voice-mode instructions for Claude (be terse, use `speak`, when to stay silent and play a confirmation tone, etc.). Distinct from the project-level `CLAUDE.md` at the repo root.
-  - MCP config for web search and any future integrations
+  - `notes/` — plain markdown
+  - `CLAUDE.md` — runtime voice-mode instructions for Claude (be terse, use `speak`, when to stay silent)
+  - MCP config for web search and future integrations
   - Settings tuned to skip permission prompts for `speak`, `WebFetch`, edits within the workspace
 
 Claude is invoked from this directory so it picks up `CLAUDE.md` and settings automatically.
 
-**Session continuity:** `--resume <session-id>` is shared across one-shot presses (so "what did I just say about X" works across presses); same session is reused within a conversational burst. Exact session-rotation policy is deferred.
+**Session continuity:** `--resume <session-id>` is shared across one-shot presses (so "what did I just say about X" works across presses); same session reused within a conversational burst. Exact rotation policy deferred.
 
 ## Communication wire
 
@@ -107,7 +114,9 @@ Two HTTP boundaries, both unauthenticated on the local network (single-user setu
 | Host orchestrator | VM Claude daemon | `POST /ask {text, mode}` | Returns when Claude finishes |
 | VM `speak` CLI | Host TTS server | `POST /speak {text}` | Returns immediately, host plays async |
 
-The host orchestrator only consumes Claude's process exit signal — not Claude's stdout. Any `speak` calls during the run already delivered audio. The orchestrator's only post-`/ask` job is transitioning the state machine.
+Both endpoints reach each other across the VMWare virtual network (NAT or host-only — concrete IP depends on user's VM network config; the VM URL on the host is typically something like `http://<vm-ip>:8003`, the host URL from the VM is `http://<host-ip>:8002`).
+
+The host orchestrator only consumes Claude's process exit signal — not Claude's stdout. Any `speak` calls during the run already delivered audio.
 
 ## Orchestrator state machine
 
@@ -146,8 +155,9 @@ Conversational mode exits on: second button tap, N seconds of silence with no ne
 ## Risks and known fallbacks
 
 - **`claude --print` subscription-plan limits**: if Claude Pro/Max rate limits bite, swap the VM wrapper daemon to call the Anthropic API directly via the Agent SDK. HTTP boundary `POST /ask` stays unchanged.
-- **WSLg audio**: needs a spike. If mic latency is unacceptable, fall back to a Windows-native audio-capture process forwarding samples to WSL over a TCP socket.
-- **CUDA version drift**: pin `cudaPackages_12_x` in the Nix flake; bump deliberately.
+- **Windows Python deployment drift**: without Nix, the host venv can drift over time (Python version mismatches, native deps recompiled, missing CUDA runtime DLLs). Mitigation: pin everything in `pyproject.toml`, document the exact Python and CUDA versions in `docs/host-setup.md`, and ship a `verify-host.ps1` script that checks the install is sane.
+- **CUDA / driver mismatch**: PyTorch wheels are pinned to a specific CUDA version. If the Windows NVIDIA driver is older than the CUDA runtime PyTorch wants, things fail quietly. Mitigation: pin a known-good combo, document it.
+- **Code dev/deploy split**: developing in NixOS and deploying to Windows means platform-specific bugs (path separators, line endings, audio device enumeration differences) can sneak in. Mitigation: a small set of integration tests runnable on Windows after install.
 
 ## Open questions (deferred to implementation planning)
 
@@ -158,3 +168,5 @@ Conversational mode exits on: second button tap, N seconds of silence with no ne
 5. **Voice selection** — Kokoro preset vs XTTS clone of the user's voice.
 6. **Auth on local HTTP endpoints** — shared secret if anything ever leaves loopback.
 7. **`claude --print` vs Agent SDK from day one** — depends on (1).
+8. **Windows service management** — Task Scheduler vs NSSM vs Startup shortcut. Decide during Phase 2.
+9. **Network reachability** — confirm VM↔host HTTP works on the user's VMWare network setup before assuming it does.

@@ -8,23 +8,25 @@ Full design: [docs/plans/2026-05-17-voice-assistant-design.md](docs/plans/2026-0
 
 ## Architecture at a glance
 
-- **Windows 11 host (RTX 4090)**: button + mic capture + STT + TTS + speaker playback. Entire stack packaged as a **NixOS-WSL distro** built from a Nix flake in the dev VM. One small AutoHotkey (or Rust) shim handles the global hotkey on the Windows side.
+- **Windows 11 host (RTX 4090)**: button + mic capture + STT + TTS + speaker playback. Runs as **native Python on Windows**, not WSL. Code is developed in the NixOS dev VM and deployed to Windows via `git pull` + a small bootstrap script.
 - **Linux VM (existing NixOS dev env)**: Claude Code wrapper daemon + `speak` CLI tool + notes workspace.
 - **Two HTTP wires**: host orchestrator → VM (`POST /ask`), VM → host (`POST /speak`).
 
 ## Key decisions
 
-- **WSL2 + WSLg, not VMWare GPU passthrough.** CUDA-on-WSL is mature; WSLg bridges audio. The host stack lives in WSL so the whole thing is one Nix-built tarball.
+- **Native Python on Windows, not WSL.** GPU passthrough to the existing VM is unsupported on VMWare Workstation; enabling WSL2 forces VMWare into WHP slow-mode for the existing dev VM. Native Windows Python keeps the dev VM unaffected and uses the host GPU directly. We lose Nix packaging for the host side; we keep it for the VM side.
 - **Claude has an explicit `speak` CLI tool**, not auto-speak-the-final-response. Lets Claude give progress updates, stay silent, or split a long response.
 - **Two interaction modes**: short tap = one-shot, long-press = conversational (VAD-driven turn-taking). Both share the same Claude session for context continuity.
 - **Use cases**: voice notes / second brain, on-demand research / Q&A, agent ops. *Not* a coding companion — Claude is not pinned to a repo.
-- **Updates are atomic**: `nix build` in the VM → `wsl --import` on the host. NixOS generations for rollback.
+- **Updates on the host = `git pull` + idempotent install script.** Not as clean as `nix build && wsl --import`, but the smallest possible deployment surface.
 
 ## Repo layout (planned, fill in as built)
 
-- `host/` — Nix flake for the WSL distro (orchestrator, STT server, TTS server) + AHK shim
+- `host/` — Python services that run on the Windows host (orchestrator, STT server, TTS server, audio capture)
 - `vm/` — Claude wrapper daemon, `speak` CLI, runtime workspace template (including its own runtime `CLAUDE.md` distinct from this one)
+- `scripts/` — `install-host.ps1`, `dev.sh`, etc.
 - `docs/plans/` — design docs and implementation plans
+- `docs/spikes/` — spike findings
 
 ## Two CLAUDE.md files (don't confuse them)
 
@@ -34,9 +36,9 @@ Full design: [docs/plans/2026-05-17-voice-assistant-design.md](docs/plans/2026-0
 ## Risks tracked
 
 - `claude --print` may hit subscription-plan rate limits. Fallback: swap wrapper daemon to Agent SDK + Anthropic API. HTTP boundary unchanged.
-- WSLg mic latency under load needs a spike before full commit.
-- CUDA libs in `nixpkgs` vs Windows NVIDIA driver: pin `cudaPackages_12_x`.
+- Windows Python venv can drift without Nix-style pinning — mitigated by strict `pyproject.toml` pins, a `verify-host.ps1` script, and documented Python+CUDA versions.
+- VMWare network setup must allow VM↔host HTTP — confirm before deep work.
 
 ## Status
 
-- 2026-05-17: Design complete, no implementation yet. Next: detailed implementation plan.
+- 2026-05-17: Design complete (Option C — native Windows Python). No implementation yet. Next: detailed implementation plan execution starting at Phase 0 spikes (CUDA-on-Windows, `claude --print` behavior).

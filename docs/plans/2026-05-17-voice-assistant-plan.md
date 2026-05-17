@@ -22,51 +22,50 @@
 
 Three things need verification before we invest in the full MVP. Each spike is timeboxed and exploratory — record findings in `docs/spikes/`, not the codebase.
 
-### Spike A: WSLg audio capture / playback latency
+### Spike A: Windows audio capture / playback sanity check
 
-**Goal:** Confirm WSLg's PulseAudio bridge can capture mic input and play output with acceptable latency and stability for a voice loop. If it can't, we need a Windows-native audio shim.
+**Goal:** Confirm `sounddevice` on Windows enumerates the user's mic and speakers and round-trips audio with sub-300ms latency. Windows audio is well-trodden ground — this is a sanity check, not a full investigation.
 
 **Steps:**
 
-1. On the Windows host: install WSL2 + Ubuntu (or NixOS-WSL if convenient) with WSLg. No NixOS commitment yet — just any WSL distro.
-2. Inside WSL: `pactl list short sources` and `pactl list short sinks`. Confirm the host's mic and speakers appear.
-3. Record 5 seconds via `parecord --format=s16le --rate=16000 --channels=1 /tmp/test.wav` then play back with `paplay /tmp/test.wav`. Listen for crackling, dropouts, or distortion.
-4. Write a 30-line Python script using `sounddevice` to: record 5s @ 16kHz mono, save to WAV, replay. Wrap each call in `time.perf_counter()` and log start-of-press → first-sample latency.
-5. Run a 60-second continuous recording. Verify zero dropouts (compare expected sample count vs actual).
-6. Repeat 3-5 a few hours later or after a host reboot to check stability.
+1. On the Windows host: install Python 3.12 (from python.org or `winget install Python.Python.3.12`) and `uv` (`winget install astral-sh.uv`).
+2. In a scratch directory: `uv venv && uv pip install sounddevice numpy soundfile`.
+3. Run a 30-line Python script: enumerate `sd.query_devices()`, list the default input and output, record 3 seconds @ 16kHz mono, write WAV, play it back.
+4. Verify the user's actual mic (not a virtual cable) is the default input. If not, note the device index for later config.
+5. Run a 30-second continuous recording. Verify the sample count matches `30 * 16000` within 1%.
 
 **Acceptance:**
-- End-of-press → first-sample latency < 500 ms
-- 60s recording produces a clean buffer (sample count matches expectation within 1%)
-- Playback has no audible glitches
+- `sd.query_devices()` lists the user's mic and speakers
+- Round-trip audio works (you can hear your voice)
+- 30s recording has no dropouts
 
-**Output:** `docs/spikes/spike-a-wslg-audio.md` with findings, measured numbers, and a recommendation (proceed with WSLg, or fall back to Windows-native shim).
+**Output:** `docs/spikes/spike-a-windows-audio.md` with the device names/indices and any quirks (Bluetooth headset behavior, mic gain, etc.).
 
-**Commit:** `chore(spike): WSLg audio findings`
+**Commit:** `chore(spike): Windows audio sanity check`
 
 ---
 
-### Spike B: CUDA-in-WSL with faster-whisper and Kokoro
+### Spike B: CUDA on Windows with faster-whisper and Kokoro
 
-**Goal:** Confirm both models run on the RTX 4090 via WSL CUDA passthrough, with acceptable latency. Identify any `nixpkgs` CUDA pin we'll need.
+**Goal:** Confirm both models run on the RTX 4090 from a stock Windows Python install, with acceptable latency. Identify the exact PyTorch+CUDA wheel combo we'll pin.
 
 **Steps:**
 
-1. Install latest Windows NVIDIA driver on the host (the WSL CUDA driver is bundled).
-2. Inside WSL: `nvidia-smi`. Confirm the 4090 appears, driver version matches.
-3. Create a throwaway venv: `uv venv && uv pip install faster-whisper`. Download `large-v3` and `distil-large-v3`. Transcribe a 10s sample clip on GPU. Log latency.
-4. Same venv: `uv pip install kokoro-onnx` (or `kokoro` package — whichever ships voices). Synthesize a 5-second sentence. Log latency. Play it.
-5. Try the same with both running concurrently — measure VRAM with `nvidia-smi -l 1` during a back-to-back STT then TTS call.
+1. Confirm a recent Windows NVIDIA driver is installed (open NVIDIA Control Panel → System Information; or `nvidia-smi.exe` from PowerShell). Note driver version.
+2. In the spike scratch venv from Spike A: install the CUDA-flavored PyTorch wheel for your driver's CUDA version (`uv pip install torch --index-url https://download.pytorch.org/whl/cu124` or similar). Verify with `python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"`.
+3. `uv pip install faster-whisper`. Download `distil-large-v3`. Transcribe a 10s sample clip on GPU. Log wall-clock latency end-to-end.
+4. `uv pip install kokoro-onnx`. Download the Kokoro v1 model + voices file (URLs in the kokoro-onnx README). Synthesize a 1-sentence reply. Log latency. Play it through your default output.
+5. Back-to-back run: STT then TTS, watching VRAM in another PowerShell window (`while ($true) { nvidia-smi.exe; Start-Sleep 1; cls }`).
 
 **Acceptance:**
-- `nvidia-smi` works in WSL, `torch.cuda.is_available()` returns True
+- `torch.cuda.is_available()` returns True; the 4090 is named
 - `distil-large-v3` transcribes a 10s clip in < 1s on GPU
 - Kokoro synthesizes a 1-sentence reply in < 500 ms
-- Combined VRAM under 8 GB so we leave room for headroom and other host GPU use
+- Combined VRAM under 8 GB
 
-**Output:** `docs/spikes/spike-b-cuda-wsl.md` with model selection (distil vs large), version pins, VRAM measurements, and any CUDA-version surprises.
+**Output:** `docs/spikes/spike-b-cuda-windows.md` with the exact NVIDIA driver version, PyTorch index URL used, model choices, latency numbers, VRAM measurements.
 
-**Commit:** `chore(spike): CUDA-in-WSL findings`
+**Commit:** `chore(spike): CUDA-on-Windows findings`
 
 ---
 
@@ -1662,7 +1661,7 @@ Before declaring Phase 1 done:
 ## Out of scope (planned for later)
 
 - **Phase 1.5 polish:** true hold-to-talk semantics (record while held, not fixed window). Confirmation tones. Streaming JSON output from Claude (so we can speak progress before final exit).
-- **Phase 2 — NixOS-WSL packaging:** Nix flake produces a `nixosConfigurations.voice-host.config.system.build.tarballBuilder` artifact; AutoHotkey shim for the Windows side; deploy/update docs.
+- **Phase 2 — Windows-native packaging and deploy:** `scripts/install-host.ps1` that creates a Windows venv, installs deps, downloads model weights, registers services (Task Scheduler vs NSSM — TBD); `scripts/verify-host.ps1` sanity check; deploy/update docs.
 - **Phase 3 — Conversational mode:** Silero VAD, multi-turn state machine, exit conditions (silence timeout, second tap, Claude signaling end).
 - **Phase 4 — Polish + integrations:** barge-in / TTS ducking, wake-word (openWakeWord), MCP integrations (calendar, email, GitHub PRs), voice tuning.
 
