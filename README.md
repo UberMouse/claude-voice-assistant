@@ -11,9 +11,13 @@ A push-to-talk voice interface to Claude Code.
 
 ## Next
 
-- **Phase 1.5 — true press-and-hold.** Replace the fixed `VOICE_CAPTURE_SECS=5` window with start-on-press / stop-on-release; today the hotkey only debounces.
 - **Phase 1.5 — conversational long-press mode.** Long-press hands the mic over to a VAD-driven turn-taking loop sharing the same Claude session.
-- **Daemon: stream `speak` calls live.** Right now the orchestrator waits for `/ask` to return before going idle; partial `speak` invocations during a long turn could play sooner if `/ask` streamed.
+- **Daemon: stream `/ask` events live.** Today the orchestrator blocks on `/ask` until Claude emits its `result` event; tool-use events (including `speak`) are only observable in the daemon log. Streaming them back over SSE/chunked HTTP unlocks:
+  - **Barge-in / cancel.** Orchestrator can watch for a new F3 press (or a "stop" voice command) mid-turn and abort the Claude turn instead of waiting it out — critical when Claude misunderstands and starts a long answer.
+  - **Conversational long-press prerequisite.** The VAD turn-taking loop needs to know *now* whether Claude is still speaking, thinking, or done — not after the whole turn lands. Without streaming, long-press mode either deadlocks on `/ask` or has to poll.
+  - **Live UX feedback.** A short earcon or "thinking…" cue when Claude starts a tool call (especially long ones like web fetches) tells the user the system heard them, without waiting for the first `speak` to land.
+  - **Earlier rate-limit / error surfacing.** `rate_limit_event` is already parsed in the daemon; streaming lets the orchestrator react (e.g., synthesize a "rate-limited, try again at HH:MM" cue) instead of swallowing it inside a still-pending `/ask`.
+  - **Cleaner idle accounting.** Orchestrator can mark itself idle the moment Claude's `result` event arrives instead of after the HTTP response unwinds, tightening the gap before the next hotkey press is accepted.
 - **Permission-mode hardening.** `Bash(speak:*)` works because of the workspace allowlist; revisit whether we need `--permission-mode` for safety once we add more tools.
 - **Rate-limit surfacing.** Daemon already parses `rate_limit_event`; expose via `speak "five-hour limit resets at HH:MM"` when the user asks.
 - **Docs polish.** Make `VOICE_TTS_URL` on the VM side more prominent in `docs/windows-setup.md` — forgetting it is the most common cause of silent failures.
