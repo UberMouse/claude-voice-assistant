@@ -7,12 +7,12 @@ from vm.claude_daemon.session import SessionStore
 
 
 class FakeProcess:
-    def __init__(self, speak_seen: bool = True):
+    def __init__(self, needs_fallback_speak: bool = False):
         self.session_id = None
         self.last_rate_limit = None
         self.asks = []
         self._resume = None
-        self._speak_seen = speak_seen
+        self._needs_fallback_speak = needs_fallback_speak
 
     async def ensure_alive(self, resume_id):
         self._resume = resume_id
@@ -22,7 +22,8 @@ class FakeProcess:
         if self.session_id is None:
             self.session_id = "p-sid"
             persist_session_id("p-sid")
-        return AskResult(text="answered:" + text, speak_seen=self._speak_seen)
+        return AskResult(text="answered:" + text,
+                         needs_fallback_speak=self._needs_fallback_speak)
 
     async def stop(self):
         pass
@@ -56,12 +57,12 @@ def test_ask_persists_and_returns(tmp_path, captured_speaks):
         assert proc._resume is None  # tmp store was empty
 
 
-def test_fallback_speaks_result_when_claude_skipped_speak(tmp_path, captured_speaks):
-    """If process.ask returns speak_seen=False, the daemon must speak
-    result_text directly so the user isn't left with just acks + silence.
-    The post-ack must be suppressed on this path (it would land on top of
-    the actual answer)."""
-    proc = FakeProcess(speak_seen=False)
+def test_fallback_speaks_result_when_answer_landed_in_text(tmp_path, captured_speaks):
+    """If process.ask reports the final text was never spoken (needs_fallback_speak),
+    the daemon speaks result_text directly so the user isn't left with just
+    acks + silence. The post-ack must be suppressed on this path (it would
+    land on top of the actual answer)."""
+    proc = FakeProcess(needs_fallback_speak=True)
     store = SessionStore(tmp_path / "sid")
     app = build_app(process=proc, store=store)
     with TestClient(app) as client:
@@ -74,10 +75,10 @@ def test_fallback_speaks_result_when_claude_skipped_speak(tmp_path, captured_spe
         assert fallback_text == "answered:hi"
 
 
-def test_post_ack_fires_when_claude_did_speak(tmp_path, captured_speaks):
-    """Happy path: Claude called `speak` during the turn, so we fire the
+def test_post_ack_fires_when_closing_speak_happened(tmp_path, captured_speaks):
+    """Happy path: Claude closed the turn with a `speak`, so we fire the
     post-ack ("Processed") and skip the fallback."""
-    proc = FakeProcess(speak_seen=True)
+    proc = FakeProcess(needs_fallback_speak=False)
     store = SessionStore(tmp_path / "sid")
     app = build_app(process=proc, store=store)
     with TestClient(app) as client:

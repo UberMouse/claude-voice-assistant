@@ -81,17 +81,18 @@ def build_app(process: ClaudeProcess, store: SessionStore) -> FastAPI:
         asyncio.create_task(_fire_speak(_pre_ack_text(), "pre-ack"))
         try:
             result = await process.ask(req.text, store.write)
-            if not result.speak_seen and result.text.strip():
-                # Claude never called `speak` during the turn (a Haiku failure
-                # mode: it puts the answer in its final assistant message and
+            if result.needs_fallback_speak and result.text.strip():
+                # Claude's final assistant message contained text that was
+                # never followed by a `speak` (a Haiku failure mode: it acks,
+                # does some work, then writes the answer as plain text and
                 # ends the turn). The orchestrator doesn't speak result_text,
                 # so without this fallback the user hears only acks. Skip the
                 # post-ack on this path — speaking the answer is its own
                 # end-of-turn cue, and "Processed" on top would be noise.
                 asyncio.create_task(_fire_speak(result.text, "speak-fallback"))
             else:
-                # Turn completed cleanly and Claude spoke at least once —
-                # fire a post-ack so the user has a reliable "this turn is
+                # Turn completed cleanly and the final user-facing content
+                # went through speak — fire a post-ack as a "this turn is
                 # done" cue. Skipped on the abort path below: that already
                 # produces a degraded experience and a chirp would be noise.
                 asyncio.create_task(_fire_speak(_post_ack_text(), "post-ack"))

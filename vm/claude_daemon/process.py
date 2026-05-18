@@ -22,14 +22,18 @@ log = logging.getLogger(__name__)
 class AskResult:
     """Result of a single /ask turn.
 
-    `speak_seen` tells the daemon's HTTP layer whether Claude actually called
-    the `speak` tool during the turn. If not, server.py falls back to speaking
-    `text` directly so the user never gets stuck with just acks + silence —
-    a recurring Haiku failure mode where the answer lands in the final
-    assistant message instead of a `speak` tool call.
+    `needs_fallback_speak` is True when, at the end of the turn, there is
+    assistant text that was emitted *after* the last `speak` tool_use — i.e.
+    the user's question was answered in the final assistant message body
+    instead of through `speak`. Server.py speaks `text` directly in that case
+    so the user isn't left with just acks + silence.
+
+    Tracking "did *any* speak happen this turn" is too loose: the opening
+    ack-speak ("Looking that up.") trips it and then a missed closing speak
+    slips through. We need "did the most-recent emitted text get spoken?".
     """
     text: str
-    speak_seen: bool
+    needs_fallback_speak: bool
 
 
 class ClaudeProcess:
@@ -99,7 +103,11 @@ class ClaudeProcess:
             await self._proc.stdin.drain()
             log.info("claude-daemon: sent user message (%d chars)", len(text))
 
-            speak_seen = False
+            # True when there's assistant text on the stream that hasn't been
+            # followed by a `speak`. Set on assistant.text, cleared by speak
+            # tool_use. At result-time, if still set, the final answer landed
+            # in text and needs a fallback speak.
+            text_awaiting_speak = False
             loop = asyncio.get_event_loop()
             deadline = loop.time() + self.turn_timeout_s
             try:
@@ -117,9 +125,12 @@ class ClaudeProcess:
                         log.info("claude-daemon: stream non-JSON: %r", line[:200])
                         continue
                     _log_stream_event(obj)
-                    if not speak_seen and _event_invokes_speak(obj):
-                        speak_seen = True
-                        log.info("claude-daemon: speak tool_use observed")
+                    new_text_awaiting_speak = _update_awaiting_speak(
+                        text_awaiting_speak, obj)
+                    if new_text_awaiting_speak != text_awaiting_speak:
+                        text_awaiting_speak = new_text_awaiting_speak
+                        log.info("claude-daemon: text_awaiting_speak=%s",
+                                 text_awaiting_speak)
                     t = obj.get("type")
                     if t == "system" and obj.get("subtype") == "init":
                         sid = obj.get("session_id")
@@ -129,8 +140,9 @@ class ClaudeProcess:
                     elif t == "rate_limit_event":
                         self.last_rate_limit = obj.get("rate_limit_info")
                     elif t == "result":
-                        return AskResult(text=obj.get("result", "") or "",
-                                         speak_seen=speak_seen)
+                        return AskResult(
+                            text=obj.get("result", "") or "",
+                            needs_fallback_speak=text_awaiting_speak)
             except (asyncio.TimeoutError, RuntimeError):
                 # Subprocess is now in an indeterminate state: the model may
                 # still be mid-tool-call with pending stdout. We can't safely
@@ -182,25 +194,51 @@ def _truncate(s: str, n: int = 240) -> str:
 _SPEAK_CMD_RE = re.compile(r"^\s*speak(\s|$|[\"'])")
 
 
-def _event_invokes_speak(obj: dict) -> bool:
-    """True iff `obj` is an assistant message whose content list contains a
-    Bash tool_use that runs the `speak` CLI. The runtime exposes `speak` as a
-    shell command, not a native tool — so every speak shows up as
-    `tool_use name="Bash" input={"command": "speak ..."}`."""
+def _block_is_speak_tool_use(block: dict) -> bool:
+    """True iff `block` is a Bash tool_use whose command invokes the `speak`
+    CLI. The runtime exposes `speak` as a shell command, not a native tool —
+    so every speak shows up as `tool_use name="Bash" input.command="speak ..."`."""
+    if not isinstance(block, dict):
+        return False
+    if block.get("type") != "tool_use" or block.get("name") != "Bash":
+        return False
+    cmd = (block.get("input") or {}).get("command", "")
+    return isinstance(cmd, str) and bool(_SPEAK_CMD_RE.match(cmd))
+
+
+def _update_awaiting_speak(prev: bool, obj: dict) -> bool:
+    """Fold one stream event into the `text_awaiting_speak` flag.
+
+    Walks the assistant message's content blocks in order:
+      - assistant.text with non-whitespace content → sets the flag (this text
+        was emitted and hasn't been spoken yet)
+      - `speak` tool_use → clears the flag (the pending text — or at least
+        the user-facing intent — has been spoken)
+
+    Non-assistant events (system, user/tool_result, rate_limit, result) pass
+    through unchanged. Mixed content in a single event is handled by walking
+    blocks in order: text+speak in the same event ends with flag cleared.
+    """
     if obj.get("type") != "assistant":
-        return False
+        return prev
     content = (obj.get("message") or {}).get("content")
+    state = prev
+    if isinstance(content, str):
+        if content.strip():
+            state = True
+        return state
     if not isinstance(content, list):
-        return False
+        return state
     for block in content:
         if not isinstance(block, dict):
             continue
-        if block.get("type") != "tool_use" or block.get("name") != "Bash":
-            continue
-        cmd = (block.get("input") or {}).get("command", "")
-        if isinstance(cmd, str) and _SPEAK_CMD_RE.match(cmd):
-            return True
-    return False
+        bt = block.get("type")
+        if bt == "text":
+            if (block.get("text") or "").strip():
+                state = True
+        elif bt == "tool_use" and _block_is_speak_tool_use(block):
+            state = False
+    return state
 
 
 def _log_stream_event(obj: dict) -> None:
