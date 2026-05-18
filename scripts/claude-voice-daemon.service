@@ -26,6 +26,13 @@ EnvironmentFile=-%h/.config/voice-assistant/daemon.env
 # this daemon over the VM's LAN address. Override in daemon.env if needed.
 Environment=VOICE_CLAUDE_HOST=0.0.0.0
 
+# systemd-user starts with a near-empty PATH (systemd's own bin only). The
+# daemon spawns `claude --print`, whose Bash tool inherits this PATH and
+# appends a small sandbox -- so without this line the workspace `speak` shim
+# (in ~/.local/bin) and basic coreutils (in /run/current-system/sw/bin on
+# NixOS) are both unreachable. Order mirrors a NixOS interactive login PATH.
+Environment=PATH=%h/.nix-profile/bin:%h/.local/state/nix/profile/bin:/etc/profiles/per-user/%u/bin:/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin:/run/wrappers/bin:%h/.local/bin
+
 Restart=on-failure
 RestartSec=3
 
