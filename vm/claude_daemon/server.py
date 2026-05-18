@@ -33,7 +33,7 @@ async def _fire_pre_ack() -> None:
     Disable by setting VOICE_PRE_ACK_TEXT="" (empty). Override text via the same
     env var. Failures are logged and swallowed — pre-ack must never block /ask.
     """
-    text = os.environ.get("VOICE_PRE_ACK_TEXT", "Mm-hm.")
+    text = os.environ.get("VOICE_PRE_ACK_TEXT", "Processing")
     if not text:
         return
     url = os.environ.get("VOICE_TTS_URL", "http://127.0.0.1:8002")
