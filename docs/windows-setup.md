@@ -2,7 +2,7 @@
 
 One-time walkthrough for getting the Windows side of the voice assistant running. The Linux VM side is covered by the main README's `nix develop` flow.
 
-The Windows host runs: **STT server** (faster-whisper on RTX 4090), **TTS server** (Kokoro), and the **orchestrator** (mic capture + F3 hotkey + glue). The VM runs the **Claude wrapper daemon** and the **`speak` CLI**. Two HTTP wires connect them: host → VM `POST /ask`, VM → host `POST /speak`.
+The Windows host runs: **STT server** (faster-whisper on RTX 4090), **TTS server** (Kokoro), and the **orchestrator** (mic capture + Lshift+F3 hotkey + glue). The VM runs the **Claude wrapper daemon** and the **`speak` CLI**. Two HTTP wires connect them: host → VM `POST /ask`, VM → host `POST /speak`.
 
 ## 0. Network model (bridged)
 
@@ -130,7 +130,7 @@ nix develop --command sh -c '. .venv/bin/activate && VOICE_CLAUDE_HOST=0.0.0.0 v
 
 `VOICE_CLAUDE_HOST=0.0.0.0` is important: the daemon must bind to all interfaces so the Windows orchestrator can reach it over the LAN.
 
-Press **F3** on the Windows side, speak within five seconds, release — you should hear a reply through the host's speakers.
+Press **Left-Shift + F3** on the Windows side, speak within five seconds, release — you should hear a reply through the host's speakers.
 
 ## 7. Ongoing maintenance
 
@@ -150,7 +150,7 @@ To stop services: close each PowerShell tab/window. There's no shared parent pro
 | `VOICE_TTS_PORT` | `8002` | TTS server port (must match the firewall rule) |
 | `VOICE_TTS_VOICE` | `af_sarah` | Kokoro voice id |
 | `VOICE_CLAUDE_URL` | _required_ | URL of the VM's claude daemon, e.g. `http://192.168.x.x:8003` |
-| `VOICE_HOTKEY` | `f3` | Push-to-talk key |
+| `VOICE_HOTKEY` | `lshift+f3` | Push-to-talk key. Single key (`f3`) or chord (`lshift+f3`, `ctrl+alt+f3`). Modifier tokens: `shift`/`lshift`/`rshift`, `ctrl`/`lctrl`/`rctrl`, `alt`/`lalt`/`ralt`, `cmd`/`win` |
 | `VOICE_CAPTURE_SECS` | `5` | MVP fixed-window capture length (Phase 1.5 will replace with hold-to-talk) |
 | `VOICE_MIC_NAME` | _unset_ | Substring of the input device name; unset falls back to system default |
 

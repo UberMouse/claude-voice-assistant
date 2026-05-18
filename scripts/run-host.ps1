@@ -10,7 +10,7 @@
 #
 # Optional:
 #   VOICE_TTS_HOST   = 0.0.0.0   # default here (so the VM can reach the TTS server)
-#   VOICE_HOTKEY     = f3
+#   VOICE_HOTKEY     = lshift+f3
 #   VOICE_CAPTURE_SECS = 5
 #
 # DEBUG-TAG: run-host

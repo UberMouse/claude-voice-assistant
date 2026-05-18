@@ -38,7 +38,7 @@ async def amain():
     stt_url    = os.environ.get("VOICE_STT_URL",    "http://127.0.0.1:8001")
     tts_url    = os.environ.get("VOICE_TTS_URL",    "http://127.0.0.1:8002")
     claude_url = os.environ.get("VOICE_CLAUDE_URL", "http://127.0.0.1:8003")
-    hotkey     = os.environ.get("VOICE_HOTKEY",     "f3")
+    hotkey     = os.environ.get("VOICE_HOTKEY",     "lshift+f3")
     mic_name   = os.environ.get("VOICE_MIC_NAME")  # substring match, Spike A
 
     rec = _build_recorder(mic_name)
@@ -67,7 +67,7 @@ async def amain():
 
 
 async def _press_release_cycle(machine: OneShotMachine, rec: Recorder):
-    """F3 starts recording. VAD ends it on trailing silence; the max-duration
+    """Hotkey press starts recording. VAD ends it on trailing silence; the max-duration
     cap (VOICE_MAX_SECS, default 30s) is enforced by the endpointer, with the
     executor wait timeout below as a belt-and-suspenders. Falls back to a
     fixed window (VOICE_CAPTURE_SECS) when VAD is disabled."""
