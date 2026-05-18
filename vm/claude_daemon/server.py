@@ -17,7 +17,7 @@ log = logging.getLogger(__name__)
 
 # DEBUG-TAG: claude-daemon
 # Grep all daemon debug logging with:
-#     grep -E "claude-(daemon|stream)|pre-ack"
+#     grep -E "claude-(daemon|stream)|pre-ack|post-ack|speak-fallback"
 
 
 class AskRequest(BaseModel):
@@ -80,13 +80,22 @@ def build_app(process: ClaudeProcess, store: SessionStore) -> FastAPI:
         # in parallel with claude's first tokens.
         asyncio.create_task(_fire_speak(_pre_ack_text(), "pre-ack"))
         try:
-            text = await process.ask(req.text, store.write)
-            # Turn completed cleanly — fire a post-ack so the user has a
-            # reliable "this turn is done" cue even if Claude forgot the
-            # closing `speak`. Skipped on the abort path below: that already
-            # produces a degraded experience and a chirp on top would be noise.
-            asyncio.create_task(_fire_speak(_post_ack_text(), "post-ack"))
-            return {"ok": True, "result_text": text}
+            result = await process.ask(req.text, store.write)
+            if not result.speak_seen and result.text.strip():
+                # Claude never called `speak` during the turn (a Haiku failure
+                # mode: it puts the answer in its final assistant message and
+                # ends the turn). The orchestrator doesn't speak result_text,
+                # so without this fallback the user hears only acks. Skip the
+                # post-ack on this path — speaking the answer is its own
+                # end-of-turn cue, and "Processed" on top would be noise.
+                asyncio.create_task(_fire_speak(result.text, "speak-fallback"))
+            else:
+                # Turn completed cleanly and Claude spoke at least once —
+                # fire a post-ack so the user has a reliable "this turn is
+                # done" cue. Skipped on the abort path below: that already
+                # produces a degraded experience and a chirp would be noise.
+                asyncio.create_task(_fire_speak(_post_ack_text(), "post-ack"))
+            return {"ok": True, "result_text": result.text}
         except (asyncio.TimeoutError, RuntimeError) as e:
             # process.ask already killed the subprocess; respawn here so the
             # next /ask doesn't have to. Return 200 with degraded payload —

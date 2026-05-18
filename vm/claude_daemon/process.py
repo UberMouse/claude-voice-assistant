@@ -8,12 +8,28 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
 log = logging.getLogger(__name__)
 
 # DEBUG-TAG: claude-daemon
+
+
+@dataclass
+class AskResult:
+    """Result of a single /ask turn.
+
+    `speak_seen` tells the daemon's HTTP layer whether Claude actually called
+    the `speak` tool during the turn. If not, server.py falls back to speaking
+    `text` directly so the user never gets stuck with just acks + silence —
+    a recurring Haiku failure mode where the answer lands in the final
+    assistant message instead of a `speak` tool call.
+    """
+    text: str
+    speak_seen: bool
 
 
 class ClaudeProcess:
@@ -73,7 +89,7 @@ class ClaudeProcess:
                 pass  # still alive — good
 
     async def ask(self, text: str,
-                  persist_session_id: Callable[[str], None]) -> str:
+                  persist_session_id: Callable[[str], None]) -> AskResult:
         async with self._lock:
             if not (self._proc and self._proc.returncode is None):
                 raise RuntimeError("claude subprocess not alive")
@@ -83,6 +99,7 @@ class ClaudeProcess:
             await self._proc.stdin.drain()
             log.info("claude-daemon: sent user message (%d chars)", len(text))
 
+            speak_seen = False
             loop = asyncio.get_event_loop()
             deadline = loop.time() + self.turn_timeout_s
             try:
@@ -100,6 +117,9 @@ class ClaudeProcess:
                         log.info("claude-daemon: stream non-JSON: %r", line[:200])
                         continue
                     _log_stream_event(obj)
+                    if not speak_seen and _event_invokes_speak(obj):
+                        speak_seen = True
+                        log.info("claude-daemon: speak tool_use observed")
                     t = obj.get("type")
                     if t == "system" and obj.get("subtype") == "init":
                         sid = obj.get("session_id")
@@ -109,7 +129,8 @@ class ClaudeProcess:
                     elif t == "rate_limit_event":
                         self.last_rate_limit = obj.get("rate_limit_info")
                     elif t == "result":
-                        return obj.get("result", "")
+                        return AskResult(text=obj.get("result", "") or "",
+                                         speak_seen=speak_seen)
             except (asyncio.TimeoutError, RuntimeError):
                 # Subprocess is now in an indeterminate state: the model may
                 # still be mid-tool-call with pending stdout. We can't safely
@@ -153,6 +174,33 @@ class ClaudeProcess:
 def _truncate(s: str, n: int = 240) -> str:
     s = s.replace("\n", " ")
     return s if len(s) <= n else s[:n] + "..."
+
+
+# Matches a Bash command that runs the `speak` CLI: leading whitespace, the
+# word `speak`, then a word boundary (space, end of string, or quote). Avoids
+# false positives like `speakers` or `speak-cli` (a logging tag, not a binary).
+_SPEAK_CMD_RE = re.compile(r"^\s*speak(\s|$|[\"'])")
+
+
+def _event_invokes_speak(obj: dict) -> bool:
+    """True iff `obj` is an assistant message whose content list contains a
+    Bash tool_use that runs the `speak` CLI. The runtime exposes `speak` as a
+    shell command, not a native tool — so every speak shows up as
+    `tool_use name="Bash" input={"command": "speak ..."}`."""
+    if obj.get("type") != "assistant":
+        return False
+    content = (obj.get("message") or {}).get("content")
+    if not isinstance(content, list):
+        return False
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") != "tool_use" or block.get("name") != "Bash":
+            continue
+        cmd = (block.get("input") or {}).get("command", "")
+        if isinstance(cmd, str) and _SPEAK_CMD_RE.match(cmd):
+            return True
+    return False
 
 
 def _log_stream_event(obj: dict) -> None:
