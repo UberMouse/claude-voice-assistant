@@ -20,7 +20,7 @@ class SpeakRequest(BaseModel):
     text: str
     voice: str | None = None
 
-def _default_kokoro_play(voice_default: str):
+def _default_kokoro_play(voice_default: str, speed_default: float):
     from kokoro_onnx import Kokoro  # local import: heavy
 
     model_path = os.environ.get("VOICE_TTS_MODEL", "kokoro-v1.0.onnx")
@@ -28,18 +28,19 @@ def _default_kokoro_play(voice_default: str):
     k = Kokoro(model_path, voices_path)
 
     async def play(text: str) -> None:
-        log.info("tts-server: synth %r", text[:60])
-        samples, sr = k.create(text, voice=voice_default, speed=1.0)
+        log.info("tts-server: synth %r @ %.2fx", text[:60], speed_default)
+        samples, sr = k.create(text, voice=voice_default, speed=speed_default)
         # sounddevice's play is blocking when wait=True; run in thread
         await asyncio.to_thread(sd.play, samples, sr, blocking=True)
 
     return play
 
 def build_app(play_fn: Callable[[str], Awaitable[None]] | None = None,
-              voice_default: str = "af_sarah") -> FastAPI:
+              voice_default: str = "af_sarah",
+              speed_default: float = 1.0) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        fn = play_fn or _default_kokoro_play(voice_default)
+        fn = play_fn or _default_kokoro_play(voice_default, speed_default)
         q = PlaybackQueue(fn)
         await q.start()
         app.state.q = q

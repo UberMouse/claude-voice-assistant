@@ -10,6 +10,7 @@
 #
 # Optional:
 #   VOICE_TTS_HOST   = 0.0.0.0   # default here (so the VM can reach the TTS server)
+#   VOICE_TTS_SPEED  = 1.5       # default here (Kokoro speed multiplier; 1.0 = native pace)
 #   VOICE_HOTKEY     = lshift+f3
 #   VOICE_CAPTURE_SECS = 5
 #
@@ -19,7 +20,10 @@ $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $Root
 
 # Bind TTS to all interfaces so the VM's `speak` CLI can reach it.
-if (-not $env:VOICE_TTS_HOST) { $env:VOICE_TTS_HOST = "0.0.0.0" }
+if (-not $env:VOICE_TTS_HOST)  { $env:VOICE_TTS_HOST  = "0.0.0.0" }
+# 1.5x is the natural-sounding upper bound for Kokoro before it starts to
+# sound thin; tune per preference. Override with $env:VOICE_TTS_SPEED.
+if (-not $env:VOICE_TTS_SPEED) { $env:VOICE_TTS_SPEED = "1.5" }
 
 if (-not $env:VOICE_CLAUDE_URL) {
   Write-Warning "VOICE_CLAUDE_URL is not set. The orchestrator will try http://127.0.0.1:8003 (wrong)."
