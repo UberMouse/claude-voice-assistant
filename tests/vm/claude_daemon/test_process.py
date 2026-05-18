@@ -2,7 +2,11 @@ import asyncio
 
 import pytest
 
-from vm.claude_daemon.process import ClaudeProcess, _update_awaiting_speak
+from vm.claude_daemon.process import (
+    ClaudeProcess,
+    _SUBSTANTIAL_SPEAK_CMD_LEN,
+    _max_speak_cmd_len_in,
+)
 
 FAKE_CLAUDE = '''#!/usr/bin/env python3
 import json, sys
@@ -37,9 +41,8 @@ async def test_process_round_trip(fake_claude, tmp_path):
     out2 = await proc.ask("again", persist_session_id=persisted.append)
     assert out1.text == "answered:hello"
     assert out2.text == "answered:again"
-    # Fake claude emits an assistant message with string content
-    # ("...thinking...") and never invokes the `speak` tool, so the turn
-    # ends with text awaiting speech → fallback is needed.
+    # Fake claude never invokes the `speak` tool, so no substantial speak
+    # was observed → fallback is needed.
     assert out1.needs_fallback_speak is True
     assert out2.needs_fallback_speak is True
     assert proc.session_id == "fake-sid-001"
@@ -65,11 +68,11 @@ def _bash_other_event(command: str) -> dict:
          "input": {"command": command}}]}}
 
 
-def _fold(events: list[dict]) -> bool:
-    state = False
+def _max_over(events: list[dict]) -> int:
+    m = 0
     for e in events:
-        state = _update_awaiting_speak(state, e)
-    return state
+        m = _max_speak_cmd_len_in(e, m)
+    return m
 
 
 @pytest.mark.parametrize("cmd, is_speak", [
@@ -83,63 +86,83 @@ def _fold(events: list[dict]) -> bool:
     ("ls", False),
 ])
 def test_speak_command_detection(cmd, is_speak):
-    """Speak detection must match `speak ...` at the start of a Bash command
-    but not unrelated commands. Tested via the fold: a single speak event
-    after a text event clears the awaiting-speak flag iff the command is a
-    real speak invocation."""
-    after_text_then_cmd = _fold([_text_event("answer"), _bash_speak_event(cmd)])
-    # If cmd is a speak, the flag clears; otherwise the text is still
-    # awaiting speech.
-    assert after_text_then_cmd is (not is_speak)
+    """Only `speak ...` at the start of a Bash command counts. Unrelated
+    commands contribute 0 to max_speak_cmd_len; speaks contribute len(cmd)."""
+    n = _max_speak_cmd_len_in(_bash_speak_event(cmd), 0)
+    if is_speak:
+        assert n == len(cmd)
+    else:
+        assert n == 0
 
 
-def test_failure_mode_ack_then_text_then_no_speak():
-    """The exact pattern observed in production: ack-speak at turn start, a
-    middle round of tool use, then the answer in plain text with no closing
-    speak. Must report True so the fallback fires."""
+def test_failure_mode_only_ack_then_text():
+    """Production failure pattern: ack-speak at turn start, a middle round
+    of tool use, then the answer in plain text with no closing speak. The
+    ack is short, so max stays below threshold → fallback fires."""
     events = [
         _bash_speak_event('speak "Looking that up."'),
         _text_event("Let me check..."),
         _bash_other_event("find / -name slack"),
         _text_event("The Slack MCP server lets Claude read your Slack..."),
     ]
-    assert _fold(events) is True
+    assert _max_over(events) < _SUBSTANTIAL_SPEAK_CMD_LEN
 
 
-def test_happy_path_speak_last():
-    """Ack-speak, some work, then a closing speak. No unspoken text → no
-    fallback needed."""
+def test_happy_path_substantial_closing_speak():
+    """Ack-speak, some work, then a substantial closing speak. Max ≥
+    threshold → no fallback."""
+    answer = 'speak "Found it — the answer is that the MCP server is X."'
+    assert len(answer) >= _SUBSTANTIAL_SPEAK_CMD_LEN  # sanity
     events = [
         _bash_speak_event('speak "On it."'),
         _text_event("Let me check..."),
         _bash_other_event("grep -r foo /etc"),
-        _bash_speak_event('speak "Found it — the answer is X."'),
+        _bash_speak_event(answer),
     ]
-    assert _fold(events) is False
+    assert _max_over(events) >= _SUBSTANTIAL_SPEAK_CMD_LEN
 
 
-def test_text_and_speak_in_same_event_block_order():
-    """A single assistant message can carry both text and a tool_use block.
-    Blocks are walked in order: text sets the flag, then speak in the same
-    message clears it."""
-    mixed = {"type": "assistant", "message": {"content": [
-        {"type": "text", "text": "Here's the answer:"},
-        {"type": "tool_use", "name": "Bash", "id": "z",
-         "input": {"command": 'speak "Yes, here it is."'}},
-    ]}}
-    assert _update_awaiting_speak(False, mixed) is False
+def test_doubled_emission_substantial_speak_then_text():
+    """Observed regression: Claude correctly spoke the answer with a
+    substantial speak, then also wrote the same content as final text. The
+    substantial speak should suppress the fallback — otherwise the daemon
+    re-speaks the text and the user hears the answer twice."""
+    answer = (
+        'speak "Found it—Slack MCP is an official integration from Slack '
+        'that lets Claude search messages, retrieve threads, send messages, '
+        'and manage canvases in your workspace."'
+    )
+    events = [
+        _bash_speak_event('speak "Searching now."'),
+        _bash_other_event("WebSearch ..."),
+        _bash_speak_event(answer),
+        _text_event("**The Slack MCP Server** is an official integration..."),
+    ]
+    assert _max_over(events) >= _SUBSTANTIAL_SPEAK_CMD_LEN
 
 
-def test_empty_text_doesnt_set_flag():
-    """Whitespace-only text shouldn't trip the flag — it's not user-facing
-    content that needs to be spoken."""
-    assert _update_awaiting_speak(False, _text_event("   ")) is False
-    assert _update_awaiting_speak(False, _text_event("")) is False
+def test_multiple_short_acks_dont_add_up_to_substantial():
+    """If Claude only ever did short acks (no real answer-speak), even
+    several of them shouldn't be mistaken for an answer. We track max, not
+    sum, so step-by-step progress speaks don't suppress the fallback."""
+    events = [
+        _bash_speak_event('speak "Step 1 done."'),
+        _bash_speak_event('speak "Step 2 done."'),
+        _bash_speak_event('speak "Step 3 done."'),
+        _text_event("Detailed report ..."),
+    ]
+    assert _max_over(events) < _SUBSTANTIAL_SPEAK_CMD_LEN
+
+
+def test_no_speak_at_all():
+    """Pure text-only failure mode — no speak observed at all."""
+    events = [_text_event("Here's the answer in text only.")]
+    assert _max_over(events) == 0
 
 
 def test_non_assistant_events_are_passthrough():
     """system, user/tool_result, rate_limit, and result events must not
-    change the flag."""
+    affect max_speak_cmd_len."""
     for obj in [
         {"type": "system", "subtype": "init"},
         {"type": "user", "message": {"content": [
@@ -148,5 +171,5 @@ def test_non_assistant_events_are_passthrough():
         {"type": "rate_limit_event", "rate_limit_info": {}},
         {"type": "result", "result": "done"},
     ]:
-        assert _update_awaiting_speak(True, obj) is True
-        assert _update_awaiting_speak(False, obj) is False
+        assert _max_speak_cmd_len_in(obj, 42) == 42
+        assert _max_speak_cmd_len_in(obj, 0) == 0

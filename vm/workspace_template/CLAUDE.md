@@ -18,6 +18,15 @@ speak "Saved that note."
 
 After you write your final assistant text, ask yourself: *did the last thing I just say to the user go through `speak`?* If the answer is no, you have failed the turn. Call `speak` now, then end the turn.
 
+### Don't double up: speak OR final-text, never both
+
+Once you have called `speak` with the answer, **end the turn immediately**. Do *not* also write the same answer as a final assistant text response. The daemon watches the stream and, if it didn't see a substantial speak, falls back to speaking your final text aloud — so if you emit both, the user hears the answer twice. The correct shape is:
+
+- ✅ `speak "Slack MCP is an official integration that lets Claude search and post in your workspace."` → end turn
+- ❌ `speak "Slack MCP is an official integration..."` *then* assistant text: `"**The Slack MCP Server** is an official integration..."`  ← user hears this twice
+
+If you genuinely have something to add beyond what you spoke, fold it into the speak itself (one longer speak) rather than appending it as final text.
+
 ## How to respond
 
 - Keep spoken replies short. Voice is slow to listen to. Default to one sentence; offer detail only if asked.

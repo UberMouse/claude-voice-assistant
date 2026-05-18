@@ -22,18 +22,36 @@ log = logging.getLogger(__name__)
 class AskResult:
     """Result of a single /ask turn.
 
-    `needs_fallback_speak` is True when, at the end of the turn, there is
-    assistant text that was emitted *after* the last `speak` tool_use — i.e.
-    the user's question was answered in the final assistant message body
-    instead of through `speak`. Server.py speaks `text` directly in that case
-    so the user isn't left with just acks + silence.
+    `needs_fallback_speak` is True when Claude likely never spoke the actual
+    answer during the turn — meaning the user heard only the daemon acks and
+    needs us to speak `text` directly. Heuristic: was there a "substantial"
+    `speak` (command length above the ack threshold)? If yes, the user
+    probably heard a real answer; if no, fall back.
 
-    Tracking "did *any* speak happen this turn" is too loose: the opening
-    ack-speak ("Looking that up.") trips it and then a missed closing speak
-    slips through. We need "did the most-recent emitted text get spoken?".
+    Two prior heuristics failed:
+      - "any speak happened" → the opening ack-speak tripped it, so missing
+        closing speaks slipped through and the user heard only the ack.
+      - "text after the last speak" → fired whenever Claude double-emitted
+        (speak the answer, then also write it as text), duplicating audio.
+
+    Substantial-speak captures "did the user hear something longer than an
+    ack?" which is the property we actually care about. False positives
+    (Claude does only a substantial-but-not-the-answer speak) and false
+    negatives (Claude speaks a one-word answer like "Yes." and writes more
+    in text) both exist but are uncommon — the alternative of duplicating
+    or missing the answer entirely is worse.
     """
     text: str
     needs_fallback_speak: bool
+
+
+# A `speak ...` Bash command this long or longer is considered "substantial"
+# — i.e. it's almost certainly the answer rather than an ack. Acks per the
+# runtime CLAUDE.md are short ("On it.", "Looking that up.", "One sec.") and
+# all land below ~35 chars including the `speak "` wrapping. The threshold
+# is intentionally a bit higher than the longest common ack to leave room
+# for variants without false-suppressing the fallback.
+_SUBSTANTIAL_SPEAK_CMD_LEN = 50
 
 
 class ClaudeProcess:
@@ -103,11 +121,12 @@ class ClaudeProcess:
             await self._proc.stdin.drain()
             log.info("claude-daemon: sent user message (%d chars)", len(text))
 
-            # True when there's assistant text on the stream that hasn't been
-            # followed by a `speak`. Set on assistant.text, cleared by speak
-            # tool_use. At result-time, if still set, the final answer landed
-            # in text and needs a fallback speak.
-            text_awaiting_speak = False
+            # Longest `speak ...` Bash command observed this turn. At
+            # result-time, if no speak crossed the substantial threshold
+            # (i.e. all speaks were ack-length), the user probably never
+            # heard the answer and the daemon falls back to speaking
+            # result.text directly.
+            max_speak_cmd_len = 0
             loop = asyncio.get_event_loop()
             deadline = loop.time() + self.turn_timeout_s
             try:
@@ -125,12 +144,12 @@ class ClaudeProcess:
                         log.info("claude-daemon: stream non-JSON: %r", line[:200])
                         continue
                     _log_stream_event(obj)
-                    new_text_awaiting_speak = _update_awaiting_speak(
-                        text_awaiting_speak, obj)
-                    if new_text_awaiting_speak != text_awaiting_speak:
-                        text_awaiting_speak = new_text_awaiting_speak
-                        log.info("claude-daemon: text_awaiting_speak=%s",
-                                 text_awaiting_speak)
+                    new_max = _max_speak_cmd_len_in(obj, max_speak_cmd_len)
+                    if new_max > max_speak_cmd_len:
+                        max_speak_cmd_len = new_max
+                        log.info("claude-daemon: max_speak_cmd_len=%d (substantial=%s)",
+                                 max_speak_cmd_len,
+                                 max_speak_cmd_len >= _SUBSTANTIAL_SPEAK_CMD_LEN)
                     t = obj.get("type")
                     if t == "system" and obj.get("subtype") == "init":
                         sid = obj.get("session_id")
@@ -140,9 +159,11 @@ class ClaudeProcess:
                     elif t == "rate_limit_event":
                         self.last_rate_limit = obj.get("rate_limit_info")
                     elif t == "result":
+                        needs_fallback = (
+                            max_speak_cmd_len < _SUBSTANTIAL_SPEAK_CMD_LEN)
                         return AskResult(
                             text=obj.get("result", "") or "",
-                            needs_fallback_speak=text_awaiting_speak)
+                            needs_fallback_speak=needs_fallback)
             except (asyncio.TimeoutError, RuntimeError):
                 # Subprocess is now in an indeterminate state: the model may
                 # still be mid-tool-call with pending stdout. We can't safely
@@ -194,51 +215,38 @@ def _truncate(s: str, n: int = 240) -> str:
 _SPEAK_CMD_RE = re.compile(r"^\s*speak(\s|$|[\"'])")
 
 
-def _block_is_speak_tool_use(block: dict) -> bool:
-    """True iff `block` is a Bash tool_use whose command invokes the `speak`
-    CLI. The runtime exposes `speak` as a shell command, not a native tool —
-    so every speak shows up as `tool_use name="Bash" input.command="speak ..."`."""
+def _speak_cmd_len(block: dict) -> int:
+    """Length of the Bash `speak ...` command in `block`, or 0 if `block`
+    isn't a speak invocation. The runtime exposes `speak` as a shell command
+    via Bash, so every speak shows up as
+    `tool_use name="Bash" input.command="speak ..."`."""
     if not isinstance(block, dict):
-        return False
+        return 0
     if block.get("type") != "tool_use" or block.get("name") != "Bash":
-        return False
+        return 0
     cmd = (block.get("input") or {}).get("command", "")
-    return isinstance(cmd, str) and bool(_SPEAK_CMD_RE.match(cmd))
+    if not isinstance(cmd, str) or not _SPEAK_CMD_RE.match(cmd):
+        return 0
+    return len(cmd)
 
 
-def _update_awaiting_speak(prev: bool, obj: dict) -> bool:
-    """Fold one stream event into the `text_awaiting_speak` flag.
+def _max_speak_cmd_len_in(obj: dict, current_max: int) -> int:
+    """Returns max(current_max, longest speak command in this event).
 
-    Walks the assistant message's content blocks in order:
-      - assistant.text with non-whitespace content → sets the flag (this text
-        was emitted and hasn't been spoken yet)
-      - `speak` tool_use → clears the flag (the pending text — or at least
-        the user-facing intent — has been spoken)
-
-    Non-assistant events (system, user/tool_result, rate_limit, result) pass
-    through unchanged. Mixed content in a single event is handled by walking
-    blocks in order: text+speak in the same event ends with flag cleared.
+    Non-assistant events pass through with current_max unchanged. An
+    assistant event's content list is walked for `speak ...` Bash tool_uses.
     """
     if obj.get("type") != "assistant":
-        return prev
+        return current_max
     content = (obj.get("message") or {}).get("content")
-    state = prev
-    if isinstance(content, str):
-        if content.strip():
-            state = True
-        return state
     if not isinstance(content, list):
-        return state
+        return current_max
+    best = current_max
     for block in content:
-        if not isinstance(block, dict):
-            continue
-        bt = block.get("type")
-        if bt == "text":
-            if (block.get("text") or "").strip():
-                state = True
-        elif bt == "tool_use" and _block_is_speak_tool_use(block):
-            state = False
-    return state
+        n = _speak_cmd_len(block)
+        if n > best:
+            best = n
+    return best
 
 
 def _log_stream_event(obj: dict) -> None:
