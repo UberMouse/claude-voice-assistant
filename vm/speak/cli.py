@@ -12,7 +12,7 @@ log = logging.getLogger(__name__)
 # DEBUG-TAG: speak-cli
 # Grep: grep -E "speak-cli"
 
-def speak(text: str, url: str | None = None, timeout: float = 5.0) -> int:
+def speak(text: str, url: str | None = None, timeout: float = 30.0) -> int:
     url = url or os.environ.get("VOICE_TTS_URL", "http://127.0.0.1:8002")
     try:
         body = json.dumps({"text": text})
