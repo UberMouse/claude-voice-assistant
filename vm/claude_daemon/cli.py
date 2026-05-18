@@ -40,7 +40,12 @@ def main():
     workdir.mkdir(parents=True, exist_ok=True)
     _bootstrap_workspace(workdir)
     state_dir = Path(os.environ.get("VOICE_STATE_DIR", str(Path.home() / ".local/state/voice-assistant")))
-    process = ClaudeProcess(workdir=workdir, binary=os.environ.get("VOICE_CLAUDE_BIN", "claude"))
+    process = ClaudeProcess(
+        workdir=workdir,
+        binary=os.environ.get("VOICE_CLAUDE_BIN", "claude"),
+        model=os.environ.get("VOICE_CLAUDE_MODEL", "haiku"),
+        fallback_model=os.environ.get("VOICE_CLAUDE_FALLBACK_MODEL", "sonnet"),
+    )
     store = SessionStore(state_dir / "session-id")
     host = os.environ.get("VOICE_CLAUDE_HOST", "127.0.0.1")
     port = int(os.environ.get("VOICE_CLAUDE_PORT", "8003"))

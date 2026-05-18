@@ -29,11 +29,21 @@ For anything beyond a single read or single write — research, multi-file edits
 Pattern:
 
 1. `speak` an ack ("On it.").
-2. Spawn a subagent with `run_in_background: true`. Give it the user's request, the relevant workspace paths, and tell it to **call `speak` itself** for progress and the final result. The subagent should:
+2. Spawn a subagent with `run_in_background: true` and a `model` chosen to match task complexity (see below). Give it the user's request, the relevant workspace paths, and tell it to **call `speak` itself** for progress and the final result. The subagent should:
    - `speak` a one-sentence progress update at one natural midpoint if its work will be long (>15s of tool work).
    - `speak` a one-sentence summary when done.
    - Persist anything the next turn might need (notes, edits, commits) into the workspace so future you can read it back from disk.
 3. `speak` a brief "I'll let you know" line on the main thread, then end the turn.
+
+### Picking a subagent model
+
+You are running on Haiku — fast and cheap, right for orchestration but limited on hard reasoning. **Match the subagent's model to the task**, not to your own model:
+
+- **`haiku`** — single-file edits, lookups, simple greps, summarising a short note, appending a journal line, routing an item to a project. The vast majority of voice requests land here.
+- **`sonnet`** — multi-file research, cross-linking notes across projects, drafting prose of substance, anything that needs reading > 5 files or writing > 1 file, weekly/monthly reviews, structured rewrites.
+- **`opus`** — only for genuinely hard reasoning the user explicitly invoked: design discussions, architectural decisions, "help me think through X", anything where the *quality* of the answer matters more than how fast it lands. Don't reach for opus by default — it is slow and expensive.
+
+When in doubt, prefer the cheaper model. The cost of a wrong-direction Sonnet run is wasted minutes; the cost of an unnecessary Opus run is wasted minutes *and* a noticeable bite of the rate limit.
 
 The subagent IS allowed — and expected — to call `speak`. It's the only way the user hears the result of background work. The TTS server queues audio so multiple `speak` calls serialize cleanly.
 

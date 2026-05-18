@@ -18,10 +18,18 @@ log = logging.getLogger(__name__)
 
 class ClaudeProcess:
     def __init__(self, workdir: Path, binary: str = "claude",
-                 turn_timeout_s: float = 120.0):
+                 turn_timeout_s: float = 120.0,
+                 model: Optional[str] = None,
+                 fallback_model: Optional[str] = None):
         self.workdir = Path(workdir)
         self.binary = binary
         self.turn_timeout_s = turn_timeout_s
+        # Model for the main thread. Subagents pick their own via the Task
+        # tool, guided by the runtime CLAUDE.md. Haiku is the right default
+        # for the main thread: it mostly orchestrates `speak` + Task dispatch
+        # and benefits from low latency far more than from raw capability.
+        self.model = model
+        self.fallback_model = fallback_model
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._lock = asyncio.Lock()
         self.session_id: Optional[str] = None
@@ -32,6 +40,10 @@ class ClaudeProcess:
                "--input-format", "stream-json",
                "--output-format", "stream-json",
                "--verbose"]
+        if self.model:
+            cmd += ["--model", self.model]
+        if self.fallback_model:
+            cmd += ["--fallback-model", self.fallback_model]
         if resume_id:
             cmd += ["--resume", resume_id]
         log.info("claude-daemon: spawn %s (cwd=%s)", " ".join(cmd), self.workdir)

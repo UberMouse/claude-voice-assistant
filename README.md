@@ -46,6 +46,8 @@ Press F3 and speak. See `docs/smoke-test.md`.
 | `VOICE_TTS_VOICE` | `af_sarah` | tts server |
 | `VOICE_WORKSPACE` | `~/voice-assistant` | claude daemon |
 | `VOICE_CLAUDE_BIN` | `claude` | claude daemon (override path to the `claude` binary) |
+| `VOICE_CLAUDE_MODEL` | `haiku` | claude daemon (main-thread model; subagents pick per task via runtime CLAUDE.md) |
+| `VOICE_CLAUDE_FALLBACK_MODEL` | `sonnet` | claude daemon (used when main model is overloaded) |
 | `VOICE_HOTKEY` | `f3` | orchestrator |
 | `VOICE_CAPTURE_SECS` | `5` | orchestrator (MVP — fixed capture window) |
 | `VOICE_MIC_NAME` | _unset_ | audio capture (substring match into device name; falls back to default input) |
