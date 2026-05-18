@@ -69,7 +69,17 @@ def build_app(process: ClaudeProcess, store: SessionStore) -> FastAPI:
         # Fire-and-forget: don't await — we want this happening on the wire
         # in parallel with claude's first tokens.
         asyncio.create_task(_fire_pre_ack())
-        text = await process.ask(req.text, store.write)
-        return {"ok": True, "result_text": text}
+        try:
+            text = await process.ask(req.text, store.write)
+            return {"ok": True, "result_text": text}
+        except (asyncio.TimeoutError, RuntimeError) as e:
+            # process.ask already killed the subprocess; respawn here so the
+            # next /ask doesn't have to. Return 200 with degraded payload —
+            # the orchestrator only cares about HTTP status, and a 5xx would
+            # leak its state machine into a stuck "awaiting_claude" state.
+            log.warning("claude-daemon: /ask aborted (%s) — respawning", e)
+            await process.ensure_alive(resume_id=store.read())
+            return {"ok": False, "error": "turn_aborted",
+                    "detail": str(e), "result_text": ""}
 
     return app

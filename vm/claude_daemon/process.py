@@ -73,30 +73,55 @@ class ClaudeProcess:
 
             loop = asyncio.get_event_loop()
             deadline = loop.time() + self.turn_timeout_s
-            while True:
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    raise asyncio.TimeoutError("turn exceeded budget")
-                line = await asyncio.wait_for(
-                    self._proc.stdout.readline(), timeout=remaining)
-                if not line:
-                    raise RuntimeError("claude closed stdout mid-turn")
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    log.info("claude-daemon: stream non-JSON: %r", line[:200])
-                    continue
-                _log_stream_event(obj)
-                t = obj.get("type")
-                if t == "system" and obj.get("subtype") == "init":
-                    sid = obj.get("session_id")
-                    if sid and sid != self.session_id:
-                        self.session_id = sid
-                        persist_session_id(sid)
-                elif t == "rate_limit_event":
-                    self.last_rate_limit = obj.get("rate_limit_info")
-                elif t == "result":
-                    return obj.get("result", "")
+            try:
+                while True:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError("turn exceeded budget")
+                    line = await asyncio.wait_for(
+                        self._proc.stdout.readline(), timeout=remaining)
+                    if not line:
+                        raise RuntimeError("claude closed stdout mid-turn")
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        log.info("claude-daemon: stream non-JSON: %r", line[:200])
+                        continue
+                    _log_stream_event(obj)
+                    t = obj.get("type")
+                    if t == "system" and obj.get("subtype") == "init":
+                        sid = obj.get("session_id")
+                        if sid and sid != self.session_id:
+                            self.session_id = sid
+                            persist_session_id(sid)
+                    elif t == "rate_limit_event":
+                        self.last_rate_limit = obj.get("rate_limit_info")
+                    elif t == "result":
+                        return obj.get("result", "")
+            except (asyncio.TimeoutError, RuntimeError):
+                # Subprocess is now in an indeterminate state: the model may
+                # still be mid-tool-call with pending stdout. We can't safely
+                # send another user message into the same stdin. Hard-kill so
+                # the next ensure_alive() spawns a fresh process (which will
+                # --resume the same session).
+                log.warning("claude-daemon: turn aborted — killing subprocess for recycle")
+                await self._kill()
+                raise
+
+    async def _kill(self) -> None:
+        """Hard-kill the subprocess and forget it. Caller is responsible for
+        spawning a replacement via ensure_alive()."""
+        if not self._proc:
+            return
+        try:
+            self._proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(self._proc.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            log.warning("claude-daemon: subprocess didn't die within 2s of kill")
+        self._proc = None
 
     async def stop(self) -> None:
         if not self._proc:

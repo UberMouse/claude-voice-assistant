@@ -56,17 +56,21 @@ class OneShotMachine:
         # FakeRecorder may return bytes; real recorder returns numpy. Caller adapts.
         audio_bytes = audio if isinstance(audio, (bytes, bytearray)) else _encode(audio)
         self.state = "transcribing"
-        log.info("orchestrator: -> transcribing (%d bytes)", len(audio_bytes))
-        text = await self.stt.transcribe(audio_bytes)
-        log.info("orchestrator: transcript=%r", text[:80])
-        if not text.strip():
-            log.info("orchestrator: empty transcript, back to idle")
+        try:
+            log.info("orchestrator: -> transcribing (%d bytes)", len(audio_bytes))
+            text = await self.stt.transcribe(audio_bytes)
+            log.info("orchestrator: transcript=%r", text[:80])
+            if not text.strip():
+                log.info("orchestrator: empty transcript, back to idle")
+                return
+            self.state = "awaiting_claude"
+            await self.claude.ask(text, mode="oneshot")
+        finally:
+            # Always return to idle, even if STT/Claude raised. Otherwise the
+            # next press is dropped by the `state != "idle"` guard in on_press
+            # and the user is locked out until the orchestrator restarts.
             self.state = "idle"
-            return
-        self.state = "awaiting_claude"
-        await self.claude.ask(text, mode="oneshot")
-        self.state = "idle"
-        log.info("orchestrator: -> idle")
+            log.info("orchestrator: -> idle")
 
 def _encode(samples) -> bytes:
     # Lazy import to keep state.py thin
