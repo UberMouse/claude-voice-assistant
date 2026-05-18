@@ -13,3 +13,4 @@ models/
 docs/spikes/*.local.md
 kokoro-v1.0.onnx
 voices-v1.0.bin
+.claude/worktrees/
