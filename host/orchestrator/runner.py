@@ -3,9 +3,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+
+import uvicorn
+
 from .state import OneShotMachine
 from .hotkey import HotkeyDispatcher, PressKind, run_pynput
 from .clients import SttHttpClient, ClaudeHttpClient, TtsHttpClient
+from .trigger import build_trigger_app
 from host.audio.capture import Recorder
 from host.audio.vad import Endpointer, SileroVadModel
 
@@ -40,6 +44,8 @@ async def amain():
     claude_url = os.environ.get("VOICE_CLAUDE_URL", "http://127.0.0.1:8003")
     hotkey     = os.environ.get("VOICE_HOTKEY",     "lshift+f3")
     mic_name   = os.environ.get("VOICE_MIC_NAME")  # substring match, Spike A
+    trigger_host = os.environ.get("VOICE_TRIGGER_HOST", "0.0.0.0")
+    trigger_port = int(os.environ.get("VOICE_TRIGGER_PORT", "8004"))
 
     rec = _build_recorder(mic_name)
     stt = SttHttpClient(stt_url)
@@ -63,7 +69,21 @@ async def amain():
 
     dispatcher = HotkeyDispatcher(on_event=on_kind)
     log.info("orchestrator: listening on key %s", hotkey)
-    await asyncio.to_thread(run_pynput, hotkey, dispatcher)
+
+    trigger_app = build_trigger_app(on_kind=on_kind)
+    trigger_config = uvicorn.Config(
+        trigger_app, host=trigger_host, port=trigger_port,
+        log_level="info", access_log=False,
+    )
+    trigger_server = uvicorn.Server(trigger_config)
+    log.info("orchestrator: HTTP trigger listening on %s:%d", trigger_host, trigger_port)
+
+    # Pynput blocks forever in a thread; uvicorn runs in the event loop.
+    # Either exiting takes the whole orchestrator down.
+    await asyncio.gather(
+        trigger_server.serve(),
+        asyncio.to_thread(run_pynput, hotkey, dispatcher),
+    )
 
 
 async def _press_release_cycle(machine: OneShotMachine, rec: Recorder):

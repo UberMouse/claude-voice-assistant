@@ -59,16 +59,21 @@ foreach ($pair in @(
   }
 }
 
-# 6. Open Windows firewall for the TTS port (VM -> host).
+# 6. Open Windows firewall for VM -> host ports (TTS + hotkey trigger).
 #    Default profile = Private (assumes you're on a trusted LAN).
-$ttsPort = if ($env:VOICE_TTS_PORT) { $env:VOICE_TTS_PORT } else { 8002 }
-$ruleName = "Claude Voice Assistant TTS (in TCP $ttsPort)"
-if (-not (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue)) {
-  Write-Host "==> Adding inbound firewall rule for TCP $ttsPort (Private profile)"
-  New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Action Allow `
-    -Protocol TCP -LocalPort $ttsPort -Profile Private | Out-Null
-} else {
-  Write-Host "==> Firewall rule already present: $ruleName"
+$ttsPort     = if ($env:VOICE_TTS_PORT)     { $env:VOICE_TTS_PORT }     else { 8002 }
+$triggerPort = if ($env:VOICE_TRIGGER_PORT) { $env:VOICE_TRIGGER_PORT } else { 8004 }
+foreach ($pair in @(
+  @{ Port = $ttsPort;     Name = "Claude Voice Assistant TTS (in TCP $ttsPort)" },
+  @{ Port = $triggerPort; Name = "Claude Voice Assistant Hotkey Trigger (in TCP $triggerPort)" }
+)) {
+  if (-not (Get-NetFirewallRule -DisplayName $pair.Name -ErrorAction SilentlyContinue)) {
+    Write-Host "==> Adding inbound firewall rule for TCP $($pair.Port) (Private profile)"
+    New-NetFirewallRule -DisplayName $pair.Name -Direction Inbound -Action Allow `
+      -Protocol TCP -LocalPort $pair.Port -Profile Private | Out-Null
+  } else {
+    Write-Host "==> Firewall rule already present: $($pair.Name)"
+  }
 }
 
 Write-Host ""
