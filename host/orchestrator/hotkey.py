@@ -1,9 +1,7 @@
-"""Hotkey dispatcher. Wraps pynput at runtime, but the classification is pure."""
+"""Hotkey dispatcher. Wraps pynput at runtime, but the wiring is pure."""
 from __future__ import annotations
-import enum
 import logging
 import threading
-import time
 from typing import Callable, Optional
 
 log = logging.getLogger(__name__)
@@ -11,32 +9,43 @@ log = logging.getLogger(__name__)
 # DEBUG-TAG: hotkey
 # Grep: grep -E "hotkey"
 
-class PressKind(str, enum.Enum):
-    SHORT = "short"
-    LONG = "long"
 
 class HotkeyDispatcher:
-    def __init__(self, short_press_ms: int = 300, on_event: Optional[Callable[[PressKind], None]] = None):
-        self._short_ms = short_press_ms
-        self._on_event = on_event or (lambda _: None)
-        self._press_ts_ms: Optional[int] = None
+    """Fires `on_press` when the hotkey is depressed and `on_release` when it
+    is released. The dispatcher tracks press state so a stray release without
+    a matching press is ignored.
+
+    Press classification (SHORT/LONG) was removed when the assistant moved to
+    real push-to-talk: VAD now decides end-of-utterance only after release, so
+    the hold duration no longer changes behavior.
+    """
+
+    def __init__(
+        self,
+        on_press: Optional[Callable[[], None]] = None,
+        on_release: Optional[Callable[[], None]] = None,
+    ):
+        self._on_press_cb = on_press or (lambda: None)
+        self._on_release_cb = on_release or (lambda: None)
+        self._pressed = False
         self._lock = threading.Lock()
 
-    def _on_press(self, t_ms: int) -> None:
+    def _on_press(self) -> None:
         with self._lock:
-            if self._press_ts_ms is None:
-                self._press_ts_ms = t_ms
-                log.debug("hotkey: press at %d", t_ms)
-
-    def _on_release(self, t_ms: int) -> None:
-        with self._lock:
-            if self._press_ts_ms is None:
+            if self._pressed:
                 return
-            held = t_ms - self._press_ts_ms
-            self._press_ts_ms = None
-        kind = PressKind.LONG if held >= self._short_ms else PressKind.SHORT
-        log.info("hotkey: %s press, held=%dms", kind, held)
-        self._on_event(kind)
+            self._pressed = True
+        log.debug("hotkey: press")
+        self._on_press_cb()
+
+    def _on_release(self) -> None:
+        with self._lock:
+            if not self._pressed:
+                return
+            self._pressed = False
+        log.debug("hotkey: release")
+        self._on_release_cb()
+
 
 def _parse_hotkey(spec: str):
     """Parse a hotkey spec like 'f3' or 'lshift+f3' into (modifiers, trigger).
@@ -98,9 +107,6 @@ def run_pynput(key: str, dispatcher: HotkeyDispatcher) -> None:
     held_mods: set = set()
     pressed = False  # whether we've dispatched a press we haven't released yet
 
-    def now_ms() -> int:
-        return int(time.perf_counter() * 1000)
-
     def all_mods_held() -> bool:
         return all(held_mods & group for group in resolved_groups)
 
@@ -111,7 +117,7 @@ def run_pynput(key: str, dispatcher: HotkeyDispatcher) -> None:
             return
         if k == target_key and not pressed and all_mods_held():
             pressed = True
-            dispatcher._on_press(now_ms())
+            dispatcher._on_press()
 
     def on_release(k):
         nonlocal pressed
@@ -120,7 +126,7 @@ def run_pynput(key: str, dispatcher: HotkeyDispatcher) -> None:
             return
         if k == target_key and pressed:
             pressed = False
-            dispatcher._on_release(now_ms())
+            dispatcher._on_release()
 
     with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
         listener.join()

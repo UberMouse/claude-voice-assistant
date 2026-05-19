@@ -73,11 +73,12 @@ class Recorder:
     Without an endpointer: ``start()`` opens the stream and ``stop()`` returns
     the captured audio (fixed-window mode).
 
-    With an endpointer: a worker thread runs the VAD against incoming frames
-    and sets ``done_event`` once end-of-utterance fires. Callers can
-    ``await wait_for_end()`` to block until that happens, then call
-    ``stop()`` to drain. ``stop()`` trims trailing silence based on the
-    endpointer result.
+    With an endpointer: ``start()`` opens the stream and buffers audio without
+    running VAD. The VAD worker only spins up once the caller invokes
+    ``begin_endpointing()`` — typically when the user releases the push-to-talk
+    button. This matches the user-facing model: hold-to-record, release-to-end
+    with a VAD-driven tail. Audio captured before the release is always kept
+    intact; VAD only decides where to cut the trailing tail.
     """
 
     def __init__(
@@ -106,6 +107,9 @@ class Recorder:
         self._vad_stop = threading.Event()
         self.done_event = threading.Event()
         self._endpoint_result: Optional[EndpointResult] = None
+        # Sample count at the moment VAD endpointing began. Trim uses it as a
+        # floor so the held portion of the recording is always preserved.
+        self._endpointing_start_samples: int = 0
 
     @property
     def has_endpointer(self) -> bool:
@@ -117,8 +121,10 @@ class Recorder:
         chunk = indata.copy().flatten()
         with self._lock:
             self._chunks.append(chunk)
-        if self._vad_queue is not None:
-            self._vad_queue.put(chunk)
+        # Snapshot the ref — begin_endpointing sets it from another thread.
+        q = self._vad_queue
+        if q is not None:
+            q.put(chunk)
 
     def _vad_worker(self) -> None:
         assert self._endpointer is not None and self._vad is not None
@@ -153,8 +159,9 @@ class Recorder:
         self._chunks = []
         self.done_event.clear()
         self._endpoint_result = None
+        self._endpointing_start_samples = 0
         # Open the audio stream first — if there's no device at all this is
-        # where it'll fail, and we don't want to leak a VAD worker thread.
+        # where it'll fail, and we don't want to leak any worker state.
         try:
             self._stream = sd.InputStream(
                 samplerate=self.sample_rate, channels=1,
@@ -165,13 +172,33 @@ class Recorder:
         except Exception:
             self._stream = None
             raise
-        if self._endpointer is not None:
-            self._endpointer.reset()
-            self._vad.reset()
-            self._vad_queue = queue.Queue()
-            self._vad_stop.clear()
-            self._vad_thread = threading.Thread(target=self._vad_worker, daemon=True)
-            self._vad_thread.start()
+        # VAD worker is deferred to begin_endpointing(); see class docstring.
+
+    def begin_endpointing(self) -> None:
+        """Activate VAD endpointing. Called after the user releases the
+        push-to-talk button. The worker only scores frames captured from this
+        point forward — the held portion of the recording is preserved by
+        ``stop()``'s trim logic regardless of what VAD does next.
+
+        Safe no-op if the recorder has no endpointer attached or if the worker
+        is already running."""
+        if self._endpointer is None:
+            return
+        if self._vad_thread is not None:
+            return
+        with self._lock:
+            self._endpointing_start_samples = sum(len(c) for c in self._chunks)
+        self._endpointer.reset()
+        self._vad.reset()
+        self._vad_stop.clear()
+        self._vad_queue = queue.Queue()
+        self._vad_thread = threading.Thread(target=self._vad_worker, daemon=True)
+        self._vad_thread.start()
+        log.info(
+            "audio-capture: endpointing begins at %d samples (%.2fs held)",
+            self._endpointing_start_samples,
+            self._endpointing_start_samples / self.sample_rate,
+        )
 
     async def wait_for_end(self, *, timeout: float) -> Optional[EndpointResult]:
         """Block until VAD endpointing fires, or timeout. Returns the result
@@ -211,10 +238,15 @@ class Recorder:
         result = self._endpoint_result
         if result is None:
             return samples
+        # ``last_speech_ms`` is measured from the moment VAD started feeding,
+        # i.e. release-time. The held portion of the recording lives before
+        # that and is always kept intact: the user explicitly chose to capture
+        # it by holding the button.
+        held_samples = self._endpointing_start_samples
         if result.reason == "no_speech":
-            return np.zeros(0, np.float32)
+            return samples[:held_samples] if held_samples < len(samples) else samples
         if result.reason == "silence":
-            keep_ms = result.last_speech_ms + POSTROLL_MS
-            keep_samples = int(self.sample_rate * keep_ms / 1000)
-            return samples[:keep_samples] if keep_samples < len(samples) else samples
+            tail_samples = int(self.sample_rate * (result.last_speech_ms + POSTROLL_MS) / 1000)
+            end = held_samples + tail_samples
+            return samples[:end] if end < len(samples) else samples
         return samples  # max_duration: keep everything

@@ -1,20 +1,54 @@
 import pytest
 
-from host.orchestrator.hotkey import HotkeyDispatcher, PressKind, _parse_hotkey
+from host.orchestrator.hotkey import HotkeyDispatcher, _parse_hotkey
 
-def test_short_press_classification():
-    events = []
-    d = HotkeyDispatcher(short_press_ms=300, on_event=events.append)
-    d._on_press(t_ms=0)
-    d._on_release(t_ms=100)
-    assert events == [PressKind.SHORT]
 
-def test_long_press_classification():
+def test_dispatcher_fires_press_then_release():
     events = []
-    d = HotkeyDispatcher(short_press_ms=300, on_event=events.append)
-    d._on_press(t_ms=0)
-    d._on_release(t_ms=500)
-    assert events == [PressKind.LONG]
+    d = HotkeyDispatcher(
+        on_press=lambda: events.append("press"),
+        on_release=lambda: events.append("release"),
+    )
+    d._on_press()
+    d._on_release()
+    assert events == ["press", "release"]
+
+
+def test_duplicate_press_is_ignored_until_release():
+    """A real keyboard auto-repeats while held; pynput delivers a second press
+    event but we should not start a second cycle for the same hold."""
+    events = []
+    d = HotkeyDispatcher(
+        on_press=lambda: events.append("press"),
+        on_release=lambda: events.append("release"),
+    )
+    d._on_press()
+    d._on_press()
+    d._on_release()
+    assert events == ["press", "release"]
+
+
+def test_release_without_matching_press_is_ignored():
+    events = []
+    d = HotkeyDispatcher(
+        on_press=lambda: events.append("press"),
+        on_release=lambda: events.append("release"),
+    )
+    d._on_release()
+    assert events == []
+
+
+def test_press_release_then_press_release_again():
+    events = []
+    d = HotkeyDispatcher(
+        on_press=lambda: events.append("p"),
+        on_release=lambda: events.append("r"),
+    )
+    d._on_press()
+    d._on_release()
+    d._on_press()
+    d._on_release()
+    assert events == ["p", "r", "p", "r"]
 
 
 def test_parse_single_key():

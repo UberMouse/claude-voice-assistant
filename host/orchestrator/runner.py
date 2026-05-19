@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 
 import uvicorn
 
 from .state import OneShotMachine
-from .hotkey import HotkeyDispatcher, PressKind, run_pynput
+from .hotkey import HotkeyDispatcher, run_pynput
 from .clients import SttHttpClient, ClaudeHttpClient, TtsHttpClient
 from .trigger import build_trigger_app
 from host.audio.capture import Recorder
@@ -54,6 +55,14 @@ async def amain():
     machine = OneShotMachine(recorder=rec, stt=stt, claude=claude, tts=tts)
 
     loop = asyncio.get_event_loop()
+
+    # The press cycle is split across two callbacks (press, release) so we need
+    # to bridge them. release_event is cleared on press and set on release; the
+    # cycle coroutine awaits it before activating VAD. threading.Event is used
+    # (rather than asyncio.Event) because the callbacks fire from pynput's
+    # thread; bridging happens via run_in_executor.
+    release_event = threading.Event()
+
     def _log_future_exc(fut) -> None:
         # Without this, exceptions in the fire-and-forget press cycle land on
         # an unawaited future and only surface as a GC-time warning.
@@ -61,16 +70,21 @@ async def amain():
         if exc is not None:
             log.error("orchestrator: press cycle failed", exc_info=exc)
 
-    def on_kind(kind: PressKind):
-        if kind != PressKind.SHORT:
-            log.info("orchestrator: long-press received (conversational mode not implemented yet)")
-        fut = asyncio.run_coroutine_threadsafe(_press_release_cycle(machine, rec), loop)
+    def on_press_cb():
+        # Clear before scheduling so the cycle's wait genuinely blocks until
+        # the matching release fires. on_press_cb and on_release_cb are
+        # always paired sequentially per the dispatcher's lock.
+        release_event.clear()
+        fut = asyncio.run_coroutine_threadsafe(_press_release_cycle(machine, rec, release_event), loop)
         fut.add_done_callback(_log_future_exc)
 
-    dispatcher = HotkeyDispatcher(on_event=on_kind)
+    def on_release_cb():
+        release_event.set()
+
+    dispatcher = HotkeyDispatcher(on_press=on_press_cb, on_release=on_release_cb)
     log.info("orchestrator: listening on key %s", hotkey)
 
-    trigger_app = build_trigger_app(on_kind=on_kind)
+    trigger_app = build_trigger_app(on_press=on_press_cb, on_release=on_release_cb)
     trigger_config = uvicorn.Config(
         trigger_app, host=trigger_host, port=trigger_port,
         log_level="info", access_log=False,
@@ -86,19 +100,35 @@ async def amain():
     )
 
 
-async def _press_release_cycle(machine: OneShotMachine, rec: Recorder):
-    """Hotkey press starts recording. VAD ends it on trailing silence; the max-duration
-    cap (VOICE_MAX_SECS, default 30s) is enforced by the endpointer, with the
-    executor wait timeout below as a belt-and-suspenders. Falls back to a
-    fixed window (VOICE_CAPTURE_SECS) when VAD is disabled."""
+async def _press_release_cycle(machine: OneShotMachine, rec: Recorder, release_event: threading.Event):
+    """Push-to-talk cycle.
+
+    Press starts the recorder; we then wait for release before activating
+    VAD endpointing so the user can hold the button as long as they like
+    without the silence timer firing on a pause. After release, VAD trails
+    the user's speech and fires once they stop. The max-duration cap
+    (VOICE_MAX_SECS, default 30s) is measured from release time and enforced
+    by the endpointer, with the executor wait timeout below as
+    belt-and-suspenders. Falls back to a fixed window (VOICE_CAPTURE_SECS)
+    when VAD is disabled."""
     if not await machine.on_press():
         # Recorder didn't start (no mic, or we weren't idle). Abort the cycle
-        # so we don't sit through a 30s wait on a stream that doesn't exist.
+        # so we don't wait forever on a release that won't translate to
+        # anything useful.
         return
+    loop = asyncio.get_event_loop()
     if rec.has_endpointer:
         max_secs = int(os.environ.get("VOICE_MAX_SECS", "30"))
+        hold_timeout = float(os.environ.get("VOICE_MAX_HOLD_SECS", "300"))
+        # Wait for the user to release the hotkey. Bounded by hold_timeout as
+        # a safety net so a stuck/forgotten release doesn't pin the stream.
+        released = await loop.run_in_executor(None, release_event.wait, hold_timeout)
+        if not released:
+            log.warning("orchestrator: hold timeout (%ss) without release, forcing endpointing", hold_timeout)
+        rec.begin_endpointing()
         result = await rec.wait_for_end(timeout=max_secs + 2)
         log.info("orchestrator: end-of-utterance result=%s", result)
     else:
+        # Fixed-window mode is one-shot: release is ignored, we just sleep.
         await asyncio.sleep(float(os.environ.get("VOICE_CAPTURE_SECS", "5")))
     await machine.on_release()
